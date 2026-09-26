@@ -22,7 +22,7 @@ d("MosaicService (real database)", () => {
         svc = new MosaicService(prisma as any);
         const deck = await prisma.deck.create({ data: { title: `mosaic-test-${Date.now()}` } });
         const rows = await Promise.all(
-            Array.from({ length: 60 }, (_, i) =>
+            Array.from({ length: 120 }, (_, i) =>
                 prisma.card.create({ data: { order: i, deck_id: deck.id, type: "BASIC", data: {} } }),
             ),
         );
@@ -35,9 +35,18 @@ d("MosaicService (real database)", () => {
             data: { email: `m${Date.now()}_${seq++}@t.test`, password: "x", name: "T", timezone },
         });
 
-    /** Makes the user's last-N distinct cards "answered at `at`" (like re-reviews overwrite updated_at). */
-    const study = async (userId: number, n: number, at: Date, answer: "GOOD" | "EASY" | "AGAIN" = "GOOD") => {
-        for (let i = 0; i < n; i++) {
+    /** Makes the user's next-N distinct cards (from `offset`) "answered at `at`"
+     *  (like re-reviews overwrite updated_at). Concurrent callers should use
+     *  disjoint offsets — Prisma's upsert() isn't atomic across two truly
+     *  simultaneous creates for the same composite-key row. */
+    const study = async (
+        userId: number,
+        n: number,
+        at: Date,
+        answer: "GOOD" | "EASY" | "AGAIN" = "GOOD",
+        offset = 0,
+    ) => {
+        for (let i = offset; i < offset + n; i++) {
             await prisma.cardAnswer.upsert({
                 where: { user_id_card_id: { user_id: userId, card_id: cardIds[i] } },
                 create: { user_id: userId, card_id: cardIds[i], answer, created_at: at, updated_at: at },
@@ -96,8 +105,13 @@ d("MosaicService (real database)", () => {
         const u = await newUser();
         svc.clock = () => riyadhNoon(1);
         const jobs: Promise<unknown>[] = [];
+        let offset = 0;
         for (const n of [5, 10, 15, 25, 30]) {
-            jobs.push(study(u.id, n, riyadhNoon(1)).then(() => svc.onAnswer(u.id)));
+            // Disjoint card ranges per job — these run truly concurrently, and
+            // upsert() isn't atomic across simultaneous creates for the same
+            // composite-key row, so overlapping ranges would race spuriously.
+            jobs.push(study(u.id, n, riyadhNoon(1), "GOOD", offset).then(() => svc.onAnswer(u.id)));
+            offset += n;
         }
         await Promise.all(jobs);
         await svc.onAnswer(u.id);
