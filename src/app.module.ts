@@ -26,6 +26,8 @@ import { MediaService } from "./services/media.service";
 import { ImageRestoreController } from "./controllers/image-restore.controller";
 import { ServeStaticModule } from "@nestjs/serve-static";
 import { join } from "path";
+import { MosaicController } from "./controllers/mosaic.controller";
+import { MosaicService } from "./mosaic/mosaic.service";
 
 @Module({
     imports: [
@@ -47,6 +49,7 @@ import { join } from "path";
         DecksCardsController,
         MediaController,
         ImageRestoreController,
+        MosaicController,
     ],
     providers: [
         AppService,
@@ -57,6 +60,7 @@ import { join } from "path";
         DecksService,
         DecksCardsService,
         MediaService,
+        MosaicService,
     ],
 })
 export class AppModule implements NestModule {

@@ -29,6 +29,7 @@ import {
 } from "src/utils/push.utils";
 import { v7 as uuid } from "uuid";
 import * as md5 from "md5";
+import { MosaicService } from "../mosaic/mosaic.service";
 
 // Feed events addressed to ONE person (shown only in that person's feed,
 // no celebrate / comments): "X followed you" and "X reminds you to study".
@@ -36,7 +37,10 @@ const TARGETED_EVENT_TYPES = ["followed", "reminder", "challenge_invite"];
 
 @Injectable()
 export class UsersService {
-    constructor(private prismaService: PrismaService) {}
+    constructor(
+        private prismaService: PrismaService,
+        private mosaicService: MosaicService,
+    ) {}
 
     async create(createUserDto: CreateUserDto) {
         const user = await this.prismaService.user.create({
@@ -315,6 +319,10 @@ export class UsersService {
     }
 
     async claimQuestChest(userId: number, chestId: string) {
+        // Mosaic weekly chests reuse this endpoint but have their own rules
+        // (season day, cumulative requirements, piece budget).
+        if (chestId.startsWith("mosaic_chest_"))
+            return await this.mosaicService.claimChest(userId, chestId);
         const result = await claimQuestChest(
             this.prismaService,
             userId,

@@ -23,6 +23,7 @@ import { xpForAnswer, getLevelInfo } from "src/utils/level.utils";
 import { isSameUtcDay, isYesterday, startOfUtcDay } from "src/utils/date.utils";
 import { checkAndUnlockAchievements } from "src/utils/achievement.utils";
 import { recordCardMasteryIfNew } from "src/utils/quests.utils";
+import { MosaicService } from "../mosaic/mosaic.service";
 
 // Hard ceiling on a single bulk-answer request. Prevents one request from
 // insta-completing daily/monthly quests, and keeps the loop below from
@@ -36,6 +37,7 @@ export class DecksCardsService {
         @Inject(forwardRef(() => DecksService))
         private decksService: DecksService,
         private mediaService: MediaService,
+        private mosaicService: MosaicService,
     ) {}
 
     async create(user: User, deckId: number, createCardDto: CreateCardDto) {
@@ -401,7 +403,18 @@ export class DecksCardsService {
             user.id,
         );
 
+        // Mosaic rewards are persisted inside onAnswer() BEFORE the response is
+        // built, and a failure here must never break studying: the next answer
+        // re-evaluates from the ledger and heals any missed award.
+        let mosaic = null;
+        try {
+            mosaic = await this.mosaicService.onAnswer(user.id);
+        } catch (e) {
+            log("mosaic onAnswer failed", e);
+        }
+
         return {
+            mosaic,
             leveledUp,
             newLevel: leveledUp ? levelAfter : undefined,
             streakSaved: streakResult.saved,

@@ -76,6 +76,67 @@ model User {
   fcm_token            String?
   // Friend chosen for the weekly friends quest (must follow each other).
   quest_partner_id     Int?
+  // IANA timezone reported by the app (e.g. "Asia/Riyadh"). Used ONLY by the
+  // mosaic layer for local calendar days; null until the app has synced it.
+  timezone             String?      @db.VarChar(64)
+  mosaic_seasons       MosaicSeason[]
+  mosaic_days          MosaicDay[]
+  mosaic_pieces        MosaicPiece[]
+}
+
+// One painting per user per artwork. The timezone is FROZEN here at season
+// start so travelling cannot skip or duplicate days. start_date is the local
+// calendar date (YYYY-MM-DD) of Day 1.
+model MosaicSeason {
+  id           Int       @id @default(autoincrement())
+  user_id      Int
+  artwork_id   String    @db.VarChar(64)
+  timezone     String    @db.VarChar(64)
+  start_date   String    @db.VarChar(10)
+  started_at   DateTime  @default(now())
+  completed_at DateTime?
+  user         User      @relation(fields: [user_id], references: [id])
+
+  @@unique([user_id, artwork_id])
+}
+
+// Per-local-day ledger. Counters only ever go up (max-snapshot) because
+// CardAnswer.updated_at is overwritten on re-review and cannot be re-counted
+// for past days.
+model MosaicDay {
+  user_id            Int
+  artwork_id         String   @db.VarChar(64)
+  day_index          Int
+  local_date         String   @db.VarChar(10)
+  reviews            Int      @default(0)
+  mastered           Int      @default(0)
+  chapter_done       Boolean  @default(false)
+  scheduled_released Int      @default(0)
+  catchup_released   Int      @default(0)
+  updated_at         DateTime @default(now())
+  user               User     @relation(fields: [user_id], references: [id])
+
+  @@id([user_id, artwork_id, day_index])
+}
+
+// The 100-piece guarantee lives in these three unique keys:
+// one owner per slot, one owner per piece id, one row per reward source.
+model MosaicPiece {
+  id          Int       @id @default(autoincrement())
+  user_id     Int
+  artwork_id  String    @db.VarChar(64)
+  slot        Int
+  piece_id    Int
+  kind        String    @db.VarChar(16)
+  source_key  String    @db.VarChar(64)
+  season_day  Int
+  earned_at   DateTime  @default(now())
+  revealed_at DateTime?
+  user        User      @relation(fields: [user_id], references: [id])
+
+  @@unique([user_id, artwork_id, slot])
+  @@unique([user_id, artwork_id, piece_id])
+  @@unique([user_id, artwork_id, source_key])
 }
 
 model ActivityEvent {
