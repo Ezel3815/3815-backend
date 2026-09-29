@@ -14,6 +14,7 @@ import { JwtConstant } from "src/constants/jwt.constant";
 import { LoginDto } from "src/dtos/auth/login.dto";
 import { RegisterDto } from "src/dtos/auth/register.dto";
 import { CreateDeckDto } from "src/dtos/decks/create-deck.dto";
+import { cachedHierarchy, invalidateHierarchy } from "src/utils/hierarchy-cache";
 import { DeckRecursiveOutDto } from "src/dtos/decks/deck-recursive.out-dto";
 import { ShareDeckDto } from "src/dtos/decks/share-deck.dto";
 import { UpdateDeckDto } from "src/dtos/decks/update-deck.dto";
@@ -178,21 +179,15 @@ export class DecksService {
         };
     }
 
-    async readHierarchy(user: User,) {
-        const decks: any = await this.prismaService.deck.findMany({
-            where: {
-                by_admin: true,
-                parent_id: null,
-               
-               
-               
-            },
-            include: this.generateRecursiveIncludeQuery(user, 9),
-            orderBy: {order: "asc"}
+    async readHierarchy(user: User) {
+        return cachedHierarchy(user.id, async () => {
+            const decks: any = await this.prismaService.deck.findMany({
+                where: { by_admin: true, parent_id: null },
+                include: this.generateRecursiveIncludeQuery(user, 9),
+                orderBy: { order: "asc" },
+            });
+            return decks.map((deck) => DeckRecursiveOutDto(user, deck));
         });
-
-        
-        return decks.map((deck) => DeckRecursiveOutDto(user, deck));
     }
 
 
