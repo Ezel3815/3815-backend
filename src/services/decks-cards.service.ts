@@ -1,3 +1,4 @@
+import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 import { AnswerType, DeckType, User, UserRole } from "@prisma/client";
 import { PrismaService } from "nestjs-prisma";
 import { CardOutDto } from "src/dtos/cards/card.out-dto";
@@ -413,6 +414,7 @@ export class DecksCardsService {
             log("mosaic onAnswer failed", e);
         }
 
+        invalidateHierarchy(user.id);
         return {
             mosaic,
             leveledUp,
@@ -469,6 +471,7 @@ export class DecksCardsService {
         for (let answer of bulkUpdateAnswersDto.answers) {
             await this.answer(user, answer.card_id, { answer: answer.answer });
         }
+        invalidateHierarchy(user.id);
     }
 
 }
