@@ -23,7 +23,7 @@ function applyDatabasePoolDefaults() {
 
     const [base, query = ""] = url.split("?");
     const params = new URLSearchParams(query);
-    if (!params.has("connection_limit")) params.set("connection_limit", "3");
+    if (!params.has("connection_limit")) params.set("connection_limit", "5");
     if (!params.has("pool_timeout")) params.set("pool_timeout", "20");
     process.env.DATABASE_URL = `${base}?${params.toString()}`;
 }
