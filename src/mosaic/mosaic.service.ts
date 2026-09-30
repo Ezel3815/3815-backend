@@ -83,7 +83,7 @@ export class MosaicService {
             return { status: "timezone_required", newPieces: [], piecesEarned: 0, completed: false };
         return this.retry(() =>
             this.prisma.$transaction((tx) => this.evaluateTx(tx, userId, user.timezone), {
-                maxWait: 8000,
+                maxWait: 4000,
                 timeout: 15000,
             }),
         );
@@ -155,7 +155,7 @@ export class MosaicService {
         if (k < 1 || k > CHEST_COUNT) throw new BadRequestException("Unknown chest");
         return this.retry(() =>
             this.prisma.$transaction((tx) => this.claimTx(tx, userId, k), {
-                maxWait: 8000,
+                maxWait: 4000,
                 timeout: 15000,
             }),
         );
