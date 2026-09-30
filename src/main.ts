@@ -26,6 +26,7 @@ function applyDatabasePoolDefaults() {
     if (!params.has("connection_limit")) params.set("connection_limit", "5");
     if (!params.has("pool_timeout")) params.set("pool_timeout", "20");
     process.env.DATABASE_URL = `${base}?${params.toString()}`;
+    console.log(`[db] pool: connection_limit=${params.get("connection_limit")} pool_timeout=${params.get("pool_timeout")}`);
 }
 applyDatabasePoolDefaults();
 
