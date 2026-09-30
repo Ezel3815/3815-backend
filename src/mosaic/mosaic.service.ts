@@ -83,7 +83,7 @@ export class MosaicService {
             return { status: "timezone_required", newPieces: [], piecesEarned: 0, completed: false };
         return this.retry(() =>
             this.prisma.$transaction((tx) => this.evaluateTx(tx, userId, user.timezone), {
-                maxWait: 5000,
+                maxWait: 8000,
                 timeout: 15000,
             }),
         );
@@ -155,7 +155,7 @@ export class MosaicService {
         if (k < 1 || k > CHEST_COUNT) throw new BadRequestException("Unknown chest");
         return this.retry(() =>
             this.prisma.$transaction((tx) => this.claimTx(tx, userId, k), {
-                maxWait: 5000,
+                maxWait: 8000,
                 timeout: 15000,
             }),
         );
@@ -458,15 +458,20 @@ export class MosaicService {
         };
     }
 
-    /** Retries a whole transaction on unique-key races / deadlocks (fresh snapshot each time). */
+    /**
+     * Retries a whole transaction on unique-key races / deadlocks (fresh snapshot each time),
+     * and a couple of times when the connection pool was too busy to start it (P2028).
+     */
     private async retry<T>(fn: () => Promise<T>): Promise<T> {
         for (let attempt = 1; ; attempt++) {
             try {
                 return await fn();
             } catch (e: any) {
-                const retriable = e?.code === "P2002" || e?.code === "P2034";
-                if (!retriable || attempt >= 8) throw e;
-                await new Promise((r) => setTimeout(r, 10 + Math.random() * 40 * attempt));
+                const poolBusy = e?.code === "P2028";
+                const retriable = e?.code === "P2002" || e?.code === "P2034" || poolBusy;
+                if (!retriable || attempt >= (poolBusy ? 3 : 8)) throw e;
+                const wait = poolBusy ? 200 * attempt : 10 + Math.random() * 40 * attempt;
+                await new Promise((r) => setTimeout(r, wait));
             }
         }
     }
