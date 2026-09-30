@@ -450,12 +450,19 @@ export class DecksCardsService {
                 ? user.current_streak + 1
                 : 1;
 
-        await this.prismaService.user.update({
-            where: { id: userId },
+        // Atomic claim of "today": with concurrent answer requests, only the
+        // one whose UPDATE actually flips last_study_date reports saved=true.
+        const claimed = await this.prismaService.user.updateMany({
+            where: {
+                id: userId,
+                OR: [{ last_study_date: null }, { last_study_date: { lt: today } }],
+            },
             data: { current_streak: newStreak, last_study_date: today },
         });
 
-        return { saved: true, newStreak };
+        return claimed.count === 1
+            ? { saved: true, newStreak }
+            : { saved: false, newStreak: user.current_streak };
     }
 
     async bulkAnswer(user: User, bulkUpdateAnswersDto: BulkUpdateAnswersDto) {
