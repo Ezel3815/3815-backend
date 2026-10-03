@@ -21,6 +21,7 @@ import { UpdateCardDto } from "src/dtos/cards/update-card.dto";
 import { FindQueryDto } from "src/dtos/find-query.dto";
 import { DecksCardsService } from "src/services/decks-cards.service";
 import { BulkUpdateAnswersDto } from "src/dtos/cards/bulk-update-answers.dto";
+import { MoveCardsDto } from "src/dtos/cards/move-cards.dto";
 
 @ApiTags("Cards")
 @Controller("cards")
@@ -44,6 +45,13 @@ export class DecksCardsController {
         @Body() bulkUpdateAnswersDto: BulkUpdateAnswersDto,
     ) {
         return await this.service.bulkAnswer(user, bulkUpdateAnswersDto);
+    }
+
+    // Admin only. Declared BEFORE ":deckId" so "move" is not read as a deck id.
+    @DRole()
+    @Post("move")
+    async move(@DUser() user: User, @Body() moveCardsDto: MoveCardsDto) {
+        return await this.service.move(user, moveCardsDto);
     }
 
     @DAuth()
