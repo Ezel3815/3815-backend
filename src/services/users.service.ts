@@ -706,7 +706,8 @@ b{color:#4f9d69}.open{display:inline-block;background:#4f9d69;color:#fff;padding
                 },
             });
             if (!recent) {
-                await this.prismaService.activityEvent.create({
+                // Every invitation is its own event: its id is the challenge id.
+                const invite = await this.prismaService.activityEvent.create({
                     data: {
                         user_id: userId,
                         target_user_id: friendId,
@@ -714,13 +715,28 @@ b{color:#4f9d69}.open{display:inline-block;background:#4f9d69;color:#fff;padding
                         title: "challenge_invite",
                     },
                 });
+                const friendName = me?.name ?? "صديقك";
+                const variants = [
+                    `${friendName} تحداك! يلا نحرق هالتحدي 🔥`,
+                    `${friendName} تحداك 👀 يلا نحرق هالتحدي 🔥`,
+                    `${friendName} أرسلك تحدي 😏 يلا نحرق هالتحدي!`,
+                    `${friendName} داخل عليك بتحدي 🔥 يلا نحرق هالتحدي.`,
+                    `${friendName} تحداك بالمذاكرة 👀 يلا نحرق هالتحدي!`,
+                ];
+                const body = variants[Math.floor(Math.random() * variants.length)];
                 runInBackground(() =>
                     sendPushToUser(
                         this.prismaService,
                         friendId,
-                        "دعوة تحدٍّ",
-                        `${me?.name ?? "صديقك"} دعاك لتحدي الأصدقاء هذا الأسبوع 🏆`,
-                        { type: "challenge_invite", userId: String(userId) },
+                        "تحدٍّ جديد 🔥",
+                        body,
+                        {
+                            type: "challenge_invite",
+                            userId: String(userId),
+                            friend_id: String(userId),
+                            challenge_id: String(invite.id),
+                            route: "quests",
+                        },
                     ),
                 );
             }
