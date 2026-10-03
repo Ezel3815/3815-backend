@@ -19,6 +19,7 @@ import {
 } from "@nestjs/common";
 import { AnswerCardDto } from "src/dtos/cards/answer-card.dto";
 import { BulkUpdateAnswersDto } from "src/dtos/cards/bulk-update-answers.dto";
+import { MoveCardsDto } from "src/dtos/cards/move-cards.dto";
 import { log } from "console";
 import { xpForAnswer, getLevelInfo } from "src/utils/level.utils";
 import { isSameUtcDay, isYesterday, startOfUtcDay } from "src/utils/date.utils";
@@ -479,6 +480,46 @@ export class DecksCardsService {
             await this.answer(user, answer.card_id, { answer: answer.answer });
         }
         invalidateHierarchy(user.id);
+    }
+
+    /**
+     * Admin: move cards into another deck (appended after that deck's last card,
+     * keeping the order they were given in). Users' answers follow the card
+     * (they are keyed by card id), so nobody loses progress.
+     */
+    async move(user: User, dto: MoveCardsDto) {
+        const ids = Array.from(new Set(dto.card_ids));
+
+        const target = await this.prismaService.deck.findUnique({
+            where: { id: dto.target_deck_id },
+            select: { id: true },
+        });
+        if (!target) throw new NotFoundException("Target deck not found");
+
+        const cards = await this.prismaService.card.findMany({
+            where: { id: { in: ids } },
+            select: { id: true },
+        });
+        if (cards.length !== ids.length)
+            throw new BadRequestException("Some cards do not exist");
+
+        const last = await this.prismaService.card.findFirst({
+            where: { deck_id: dto.target_deck_id },
+            orderBy: { order: "desc" },
+            select: { order: true },
+        });
+        let next = last ? last.order + 1 : 1;
+
+        await this.prismaService.$transaction(
+            ids.map((id) =>
+                this.prismaService.card.update({
+                    where: { id },
+                    data: { deck_id: dto.target_deck_id, order: next++ },
+                }),
+            ),
+        );
+        invalidateHierarchy();
+        return { moved: ids.length, target_deck_id: dto.target_deck_id };
     }
 
 }
