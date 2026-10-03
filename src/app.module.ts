@@ -28,6 +28,8 @@ import { ServeStaticModule } from "@nestjs/serve-static";
 import { join } from "path";
 import { MosaicController } from "./controllers/mosaic.controller";
 import { MosaicService } from "./mosaic/mosaic.service";
+import { NotificationsController } from "./controllers/notifications.controller";
+import { NotificationsService } from "./services/notifications.service";
 
 @Module({
     imports: [
@@ -50,6 +52,7 @@ import { MosaicService } from "./mosaic/mosaic.service";
         MediaController,
         ImageRestoreController,
         MosaicController,
+        NotificationsController,
     ],
     providers: [
         AppService,
@@ -61,6 +64,7 @@ import { MosaicService } from "./mosaic/mosaic.service";
         DecksCardsService,
         MediaService,
         MosaicService,
+        NotificationsService,
     ],
 })
 export class AppModule implements NestModule {
