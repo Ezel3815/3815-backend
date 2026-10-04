@@ -18,6 +18,12 @@ export class NotificationsController {
     }
 
     @DAuth()
+    @Post("me/push-test")
+    async pushTest(@DUser() user: User, @Body() body: { delay_seconds?: number }) {
+        return await this.service.pushTest(user.id, Number(body?.delay_seconds ?? 10));
+    }
+
+    @DAuth()
     @Post("me/notification-events")
     async events(@DUser() user: User, @Body() dto: NotificationEventsDto) {
         return await this.service.recordEvents(user.id, dto.events ?? []);
