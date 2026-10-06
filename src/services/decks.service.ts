@@ -94,7 +94,7 @@ export class DecksService {
                 by_admin: user.role == UserRole.ADMIN,
                 parent_id: createDeckDto.parent_id,
                 public: createDeckDto.public,
-                order: createDeckDto.order
+                order: createDeckDto.order ?? undefined
             },
         });
 
@@ -262,7 +262,7 @@ async readHierarchy1(user: User, parentId: number | null) {
                 title: updateDeckDto.title,
                 parent_id: updateDeckDto.parent_id,
                 public: updateDeckDto.public,
-                order: updateDeckDto.order
+                order: updateDeckDto.order ?? undefined
             },
         });
 
