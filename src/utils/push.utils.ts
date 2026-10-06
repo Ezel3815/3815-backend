@@ -77,12 +77,23 @@ export async function sendPushDetailed(
 /// a push failing (stale token, no credentials, network hiccup) must
 /// never break the request that triggered it (following someone,
 /// answering a card). Logs and swallows instead.
+/// Product rule: a user only gets a push when someone follows THEM or sends them
+/// a challenge (plus the self-test). Everything else (friends' achievements,
+/// friends following others, reminders...) stays silent. Add a type here to
+/// turn a kind of push back on.
+const ALLOWED_PUSH_TYPES = new Set(["followed", "challenge_invite", "push_test"]);
+
+function isPushAllowed(data?: Record<string, string>): boolean {
+    return !!data?.type && ALLOWED_PUSH_TYPES.has(data.type);
+}
+
 export async function sendPushToToken(
     token: string,
     title: string,
     body: string,
     data?: Record<string, string>,
 ) {
+    if (!isPushAllowed(data)) return;
     const firebaseApp = getApp();
     if (!firebaseApp) return;
     try {
@@ -137,7 +148,7 @@ export async function sendPushToFollowers(
     body: string,
     data?: Record<string, string>,
 ) {
-    if (!getApp()) return; // skip the query entirely when push is disabled
+    if (!getApp() || !isPushAllowed(data)) return; // skip the query entirely
     const [followers, actor] = await Promise.all([
         prisma.follow.findMany({
             where: { followingId: actorId },
