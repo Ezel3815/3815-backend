@@ -34,6 +34,7 @@ import { MosaicService } from "../mosaic/mosaic.service";
 // Feed events addressed to ONE person (shown only in that person's feed,
 // no celebrate / comments): "X followed you" and "X reminds you to study".
 const TARGETED_EVENT_TYPES = ["followed", "reminder", "challenge_invite"];
+const FEED_EVENT_TYPES = ["followed", "challenge_invite"];
 
 @Injectable()
 export class UsersService {
@@ -204,22 +205,14 @@ export class UsersService {
     }
 
     async getFeed(userId: number) {
-        const follows = await this.prismaService.follow.findMany({
-            where: { followerId: userId },
-            select: { followingId: true },
-        });
-        const ids = [userId, ...follows.map((f) => f.followingId)];
-
         const events = await this.prismaService.activityEvent.findMany({
             where: {
-                OR: [
-                    // own + followed users' activity (follow events excluded:
-                    // they are private notifications, see below)
-                    { user_id: { in: ids }, type: { notIn: TARGETED_EVENT_TYPES } },
-                    // "X followed you" / "X reminded you" — only for the
-                    // person they are addressed to
-                    { type: { in: TARGETED_EVENT_TYPES }, target_user_id: userId },
-                ],
+                // The feed only carries what is addressed to you: "X followed
+                // you" and "X challenged you". Friends' activity (levels,
+                // chapters, achievements...) is still recorded — other
+                // features count it — it is just not shown here.
+                type: { in: FEED_EVENT_TYPES },
+                target_user_id: userId,
             },
             orderBy: { created_at: "desc" },
             take: 40,
