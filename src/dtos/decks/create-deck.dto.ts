@@ -32,4 +32,8 @@ export class CreateDeckDto {
     @IsOptional()
     @IsBoolean()
     public: boolean = false;
+
+    @IsOptional()
+    @IsBoolean()
+    visible: boolean = true;
 }
