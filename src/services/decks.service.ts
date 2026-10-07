@@ -1,415 +1,164 @@
-import { Inject, Injectable, forwardRef } from "@nestjs/common";
-import { JwtService } from "@nestjs/jwt";
 import {
+    Card,
+    CardAnswer,
+    Deck,
     DeckType,
-    MediaType,
-    Prisma,
     User,
     UserRole,
-    UserStatus,
 } from "@prisma/client";
-import { IncomingMessage } from "http";
-import { PrismaService } from "nestjs-prisma";
-import { JwtConstant } from "src/constants/jwt.constant";
-import { LoginDto } from "src/dtos/auth/login.dto";
-import { RegisterDto } from "src/dtos/auth/register.dto";
-import { CreateDeckDto } from "src/dtos/decks/create-deck.dto";
-import { cachedHierarchy, invalidateHierarchy } from "src/utils/hierarchy-cache";
-import { DeckRecursiveOutDto } from "src/dtos/decks/deck-recursive.out-dto";
-import { ShareDeckDto } from "src/dtos/decks/share-deck.dto";
-import { UpdateDeckDto } from "src/dtos/decks/update-deck.dto";
-import { FindQueryDto } from "src/dtos/find-query.dto";
-import { CreateUserDto } from "src/dtos/users/create-user.dto";
-import { UpdateMeDto } from "src/dtos/users/update-me.dto";
-import { UpdatePasswordDto } from "src/dtos/users/update-password.dto";
-import { UpdateUserDto } from "src/dtos/users/update-user.dto";
-import { UserOutDto } from "src/dtos/users/user.out-dto";
-import { GenerateBadRequestException } from "src/exception/bad-request.exception";
-import { GenerateUnauthorizedException } from "src/exception/unauthorized.exception";
-import { GenerateUnprocessableEntityException } from "src/exception/unprocessable-entity.exception";
-import { generateRandomCode } from "src/utils/code-generation.utils";
-import uuid from "uuid";
-import { MediaService } from "./media.service";
-import { DocumentOutDto } from "src/dtos/decks/document.out-dto";
-import { UserDeckOutDto } from "src/dtos/decks/user-deck.out-dto";
-import { DecksCardsService } from "./decks-cards.service";
-import { log } from "console";
-import { DeckOutDto } from "src/dtos/decks/deck_out_dto";
 
-@Injectable()
-export class DecksService {
-    constructor(
-        private prismaService: PrismaService,
-        private mediaService: MediaService,
-        @Inject(forwardRef(() => DecksCardsService))
-        private decksCardsService: DecksCardsService,
-    ) {}
+export type DeckReqursive = Deck & {
+    cards: (Card & { answers: CardAnswer[] })[];
+    children?: DeckReqursive[];
+    users?: { user_id: number }[];
+};
 
-    async checkOwnership(
-        user: User,
-        deckId: number,
-        extraUserDeckFilters?: Prisma.UserDeckWhereInput,
-        extraDeckFilters?: Prisma.DeckWhereInput,
-    ) {
-        if (user?.role != UserRole.ADMIN) {
-            // CRITICAL: this findFirst was never awaited, so `userDeck` was
-            // always a pending Promise — never falsy — meaning this check
-            // silently passed for EVERY user on EVERY deck, regardless of
-            // actual ownership. This is the real root cause of "answered a
-            // card in another user's private deck" (BUG #1) and affected
-            // every caller of checkOwnership, not just card answers.
-            const userDeck = await this.prismaService.userDeck.findFirst({
-                where: {
-                    user_id: user.id,
-                    deck_id: deckId,
-                    ...(extraUserDeckFilters ?? {}),
-                    deck: extraDeckFilters ?? {},
-                },
-            });
+function countAnswers(cards: (Card & { answers: CardAnswer[] })[]) {
+    let easyGood = 0;
+    let again = 0;
+    let hard = 0;
 
-            if (!userDeck) return false;
-        }
-        return true;
+    for (const card of cards) {
+        const answer = card.answers?.[0]?.answer;
+        if (answer === "EASY" || answer === "GOOD") easyGood++;
+        else if (answer === "AGAIN") again++;
+        else if (answer === "HARD") hard++;
     }
 
-    async create(user: User, createDeckDto: CreateDeckDto) {
-        //TODO: check for circualr decks (one is child on one and the second is also child of the first)
-
-        if (createDeckDto.parent_id) {
-            const parent = await this.prismaService.deck.findFirst({
-                where: { id: createDeckDto.parent_id },
-            });
-
-            if (!parent || parent.type != DeckType.PACKAGE_DECK) {
-                GenerateBadRequestException([
-                    "You can't add sub-deck to this deck",
-                ]);
-            }
-        }
-
-        const deck = await this.prismaService.deck.create({
-            data: {
-                title: createDeckDto.title,
-                type: createDeckDto.type,
-                by_admin: user.role == UserRole.ADMIN,
-                parent_id: createDeckDto.parent_id,
-                public: createDeckDto.public,
-                order: createDeckDto.order ?? undefined
-            },
-        });
-
-        const userDeck = await this.prismaService.userDeck.create({
-            data: {
-                deck_id: deck.id,
-                user_id: user.id,
-                sharable: true,
-                editable: true,
-            },
-            include: {
-                deck: { include: { cards: { include: { answers: true } } } },
-            },
-        });
-
-        return UserDeckOutDto(userDeck);
-    }
-
-    async read(findQueryDto: FindQueryDto) {
-        if (findQueryDto?.filter?.by_admin) {
-            findQueryDto.filter.by_admin =
-                findQueryDto.filter.by_admin == "true";
-        }
-        const decks = await this.prismaService.deck.findMany({
-            skip: findQueryDto.skip,
-            take: findQueryDto.limit,
-            where: findQueryDto.filter ?? {},
-            orderBy: findQueryDto.sort ?? { created_at: "desc" },
-            include: { parent: true },
-        });
-
-        const count = await this.prismaService.deck.count({
-            where: findQueryDto.filter ?? {},
-        });
-
-        return { count, data: decks };
-    }
-
-    generateRecursiveIncludeQuery(
-        user: User,
-        level: number = 8,
-    ): Prisma.DeckInclude {
-        if (level == 0)
-            return {
-                cards: {
-                    include: { answers: { where: { user_id: user.id } } },
-                },
-                users: {
-                     where: { user_id: user.id,},
-                  select: { user_id: true } }, // Required to check sharing
-
-            };
-
-        return {
-            cards: { include: { answers: { where: { user_id: user.id } } } },
-            
-            users: {  where: { user_id: user.id,},
-                        select: { user_id: true } }, 
-
-            children:
-                user.role == UserRole.ADMIN
-                    ? {
-                          include: this.generateRecursiveIncludeQuery(
-                              user,
-                              level - 1,
-                          ),
-                          orderBy: {
-                              order: "asc",
-                          },
-                      }
-                    : {
-                        
-                          include: this.generateRecursiveIncludeQuery(
-                              user,
-                              level - 1,
-                          ),
-                          orderBy: {
-                              order: "asc",
-                          },
-                          
-                      },
-        };
-    }
-
-    async readHierarchy(user: User) {
-        return cachedHierarchy(user.id, async () => {
-            const decks: any = await this.prismaService.deck.findMany({
-                where: { by_admin: true, parent_id: null },
-                include: this.generateRecursiveIncludeQuery(user, 9),
-                orderBy: { order: "asc" },
-            });
-            return decks.map((deck) => DeckRecursiveOutDto(user, deck));
-        });
-    }
-
-
-async readHierarchy1(user: User, parentId: number | null) {
-    const decks = await this.prismaService.deck.findMany({
-        where: {
-            by_admin: true,
-            parent_id: parentId,
-        },
-        include: {
-            cards: {
-                include: {
-                    answers: { where: { user_id: user.id } },
-                },
-            },
-            users: {
-                where: { user_id: user.id },
-                select: { user_id: true },
-            },
-            _count: {
-                select: {
-                    children: true,
-                },
-            },
-        },
-        orderBy: {
-            order: "asc",
-        },
-    });
-
-    return decks.map((deck) => DeckOutDto(user, deck));
+    return { easyGoodCount: easyGood, againCount: again, hardCount: hard };
 }
 
-    async readMine(user: User) {
-        const userDeck = await this.prismaService.userDeck.findMany({
-            where: { user_id: user.id, deck: { by_admin: false } },
-            include: {
-                deck: {
-                    include: {
-                        cards: {
-                            include: {
-                                answers: { where: { user_id: user.id } },
-                            },
-                        },
-                    },
-                },
-            },
-        });
+/**
+ * Recursively counts every leaf card under this deck (including its own
+ * direct cards) and how many of those cards the user has answered at
+ * least once. This is the source of truth for whether a deck (subject /
+ * chapter / lesson, since they're all just "Deck" in the schema) counts
+ * as "completed" for unlocking purposes.
+ */
+function countProgressRecursive(deck: DeckReqursive): {
+    total: number;
+    attempted: number;
+} {
+    let total = deck.cards?.length ?? 0;
+    let attempted =
+        deck.cards?.filter((c) => (c.answers?.length ?? 0) > 0).length ?? 0;
 
-        return userDeck.map((ud) => UserDeckOutDto(ud));
+    for (const child of deck.children ?? []) {
+        const childProgress = countProgressRecursive(child);
+        total += childProgress.total;
+        attempted += childProgress.attempted;
     }
 
-    async readOne(id: number) {
-        const deck = await this.prismaService.deck.findUnique({
-            where: { id },
-        });
+    return { total, attempted };
+}
 
-        return deck;
+function isDeckCompleted(deck: DeckReqursive): boolean {
+    const { total, attempted } = countProgressRecursive(deck);
+    // A deck with no cards anywhere under it can never be "completed" -
+    // it shouldn't be able to silently unlock the next chapter.
+    return total > 0 && attempted === total;
+}
+
+/**
+ * @param depth 0 = top-level subject, 1 = "chapter" (the level shown as
+ *              the lesson road on the home screen - sequential unlock
+ *              applies here), 2+ = everything nested inside a chapter,
+ *              which opens all at once as soon as the chapter is unlocked.
+ * @param siblings the deck's siblings at the same level (needed to check
+ *              "was the previous one finished" for sequential unlock).
+ * @param index the deck's position among `siblings`.
+ * @param parentUnlocked whether the parent deck itself is unlocked -
+ *              a locked parent always locks everything beneath it.
+ */
+export function DeckRecursiveOutDto(
+    user: User,
+    deck: DeckReqursive,
+    depth: number = 0,
+    siblings: DeckReqursive[] = [],
+    index: number = 0,
+    parentUnlocked: boolean = true,
+) {
+    const { cards, ...deckWithoutCards } = deck;
+
+    // Hidden decks (visible = false) are not shown to regular users at all.
+    const visibleChildren = (deck.children ?? []).filter(
+        (c: any) => user.role == UserRole.ADMIN || c.visible !== false,
+    );
+
+    const shared = deck.users.some((u) => u.user_id === user.id);
+
+    // Pre-existing gating: not public/shared, or an empty package/deck.
+    const baseLocked =
+        user.role != UserRole.ADMIN &&
+        ((deck.public && shared === false) ||
+            (deck.type == DeckType.PACKAGE_DECK &&
+                visibleChildren.length == 0) ||
+            (deck.type == DeckType.CARDS_DECK && deck.cards.length == 0));
+
+    // A "chapter" is a card deck among sibling card decks (the lesson road),
+    // wherever it sits in the tree. Sequential unlock applies only there —
+    // NOT to subjects/years, or every subject after the first would be
+    // hidden until the previous one was fully finished.
+    const isChapter =
+        deck.type == DeckType.CARDS_DECK &&
+        siblings.length > 0 &&
+        siblings.every((s) => s.type == DeckType.CARDS_DECK);
+
+    // A chapter unlocks once the previous chapter is fully completed.
+    let sequentialLocked = false;
+    if (user.role != UserRole.ADMIN && isChapter && index > 0) {
+        const previousSibling = siblings[index - 1];
+        sequentialLocked = !isDeckCompleted(previousSibling);
     }
 
-    async update(user: User, id: number, updateDeckDto: UpdateDeckDto) {
-        if (!(await this.checkOwnership(user, id, { editable: true })))
-            GenerateBadRequestException([
-                "You can't edit a deck that you don't own",
-            ]);
+    const isLocked = baseLocked || !parentUnlocked || sequentialLocked;
 
-        const deck = await this.prismaService.deck.update({
-            where: {
-                id,
-            },
-            data: {
-                title: updateDeckDto.title,
-                parent_id: updateDeckDto.parent_id,
-                public: updateDeckDto.public,
-                order: updateDeckDto.order ?? undefined
-            },
-        });
+    const completed = isDeckCompleted(deck);
+    const { total, attempted } = countProgressRecursive(deck);
+    const progressPercent =
+        total > 0 ? Math.round((attempted / total) * 100) : 0;
 
-        return deck;
-    }
+    // The single chapter the home-screen road should highlight as
+    // "in progress" - the first unlocked-but-not-finished chapter.
+    const current = isChapter && !isLocked && !completed;
 
-    async deleteIfOrphan(deckId: number) {
-        const deck = await this.prismaService.deck.findUnique({
-            where: {
-                id: deckId,
-            },
-            include: {
-                cards: true,
-            },
-        });
+    const answerCounts = countAnswers(deck.cards);
 
-        if (deck.by_admin) return;
-
-        const count = await this.prismaService.userDeck.count({
-            where: {
-                deck_id: deckId,
-            },
-        });
-
-        if (count == 0) {
-            await this.delete(deckId);
-        }
-    }
-
-    async delete(id: number) {
-        const cards = await this.prismaService.card.findMany({
-            where: { deck_id: id },
-        });
-
-        for (let card of cards) {
-            await this.decksCardsService.delete(undefined, id, card.id);
-        }
-
-        await this.prismaService.$transaction([
-            this.prismaService.userDeck.deleteMany({
-                where: {
-                    deck_id: id,
-                },
-            }),
-
-            this.prismaService.card.deleteMany({
-                where: {
-                    deck_id: id,
-                },
-            }),
-
-            this.prismaService.codeDeck.deleteMany({
-                where: {
-                    deck_id: id,
-                },
-            }),
-
-            this.prismaService.deck.delete({
-                where: { id },
-            }),
-        ]);
-    }
-
-    async unlink(user: User, id: number) {
-        // Same class of bug as inside checkOwnership itself: calling an
-        // async function without awaiting it means you're negating a
-        // Promise, which is never falsy, so this check never fired.
-        if (!(await this.checkOwnership(user, id, { editable: true })))
-            GenerateBadRequestException([
-                "You can't delete a deck that you don't own",
-            ]);
-
-        const deck = await this.prismaService.userDeck.delete({
-            where: { user_id_deck_id: { user_id: user.id, deck_id: id } },
-        });
-
-        await this.deleteIfOrphan(id);
-
-        if (!deck) GenerateBadRequestException(["User does not exist"]);
-
-        return true;
-    }
-
-    async getShareCode(user: User, id: number, shareDeckDto: ShareDeckDto) {
-        // Same missing-await bug as unlink() above.
-        if (!(await this.checkOwnership(user, id, { sharable: true })))
-            GenerateBadRequestException(["You can't share this deck"]);
-
-        const code = generateRandomCode(6);
-
-        const userDeck = await this.prismaService.userDeck.update({
-            where: {
-                user_id_deck_id: {
-                    user_id: user.id,
-                    deck_id: id,
-                },
-            },
-            data: {
-                share_is_editable: shareDeckDto.editable,
-                share_is_sharable: shareDeckDto.sharable,
-                share_code: code,
-            },
-        });
-
-        return { code };
-    }
-
-    async linkByShareCode(user: User, code: string) {
-        const userDeck = await this.prismaService.userDeck.findFirst({
-            where: {
-                share_code: code,
-            },
-        });
-
-        if (!userDeck) GenerateBadRequestException(["Wrong code"]);
-
-        const currentUserDeck = await this.prismaService.userDeck.findFirst({
-            where: {
-                user_id: user.id,
-                deck_id: userDeck.deck_id,
-            },
-        });
-
-        if (currentUserDeck) {
-            await this.prismaService.userDeck.update({
-                where: {
-                    user_id_deck_id: {
-                        user_id: user.id,
-                        deck_id: userDeck.deck_id,
-                    },
-                },
-                data: {
-                    editable:
-                        currentUserDeck.editable || userDeck.share_is_editable,
-                    sharable:
-                        currentUserDeck.sharable || userDeck.share_is_sharable,
-                },
-            });
-        } else {
-            await this.prismaService.userDeck.create({
-                data: {
-                    user_id: user.id,
-                    deck_id: userDeck.deck_id,
-                    editable: userDeck.share_is_editable,
-                    sharable: userDeck.share_is_sharable,
-                },
-            });
-        }
-    }
+    return {
+        ...deckWithoutCards,
+        // Slim card list (id + the user's answer) so clients can compute
+        // progress; full card data is fetched per deck via /cards/:deckId.
+        cards: cards.map((c) => ({
+            id: c.id,
+            deck_id: c.deck_id,
+            order: c.order,
+            type: c.type,
+            answer: c.answers?.[0]?.answer ?? "NONE",
+        })),
+        editable: user.role == UserRole.ADMIN,
+        sharable: false,
+        easyGoodCount: answerCounts.easyGoodCount,
+        againCount: answerCounts.againCount,
+        hardCount: answerCounts.hardCount,
+        totalCards: total,
+        attemptedCards: attempted,
+        progressPercent,
+        completed,
+        current,
+        children:
+            isLocked === true
+                ? []
+                : visibleChildren.map((child, childIndex) =>
+                      DeckRecursiveOutDto(
+                          user,
+                          child,
+                          depth + 1,
+                          visibleChildren,
+                          childIndex,
+                          !isLocked,
+                      ),
+                  ),
+        shared,
+        locked: isLocked,
+    };
 }
