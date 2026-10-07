@@ -30,4 +30,12 @@ export class UpdateDeckDto {
     @IsOptional()
     @IsBoolean()
     public: boolean;
+
+    @IsOptional()
+    @IsBoolean()
+    visible: boolean;
+
+    @IsOptional()
+    @IsEnum(DeckType)
+    type: DeckType;
 }
