@@ -29,6 +29,8 @@ import { join } from "path";
 import { MosaicController } from "./controllers/mosaic.controller";
 import { MosaicService } from "./mosaic/mosaic.service";
 import { NotificationsController } from "./controllers/notifications.controller";
+import { BackupController } from "./controllers/backup.controller";
+import { BackupService } from "./services/backup.service";
 import { NotificationsService } from "./services/notifications.service";
 
 @Module({
@@ -53,6 +55,7 @@ import { NotificationsService } from "./services/notifications.service";
         ImageRestoreController,
         MosaicController,
         NotificationsController,
+        BackupController,
     ],
     providers: [
         AppService,
@@ -65,6 +68,7 @@ import { NotificationsService } from "./services/notifications.service";
         MediaService,
         MosaicService,
         NotificationsService,
+        BackupService,
     ],
 })
 export class AppModule implements NestModule {
