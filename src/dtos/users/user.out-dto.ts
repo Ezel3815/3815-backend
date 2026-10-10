@@ -34,6 +34,7 @@ export function UserOutDto(user: User) {
         avatar_clothing_color: user.avatar_clothing_color,
         avatar_glasses: user.avatar_glasses,
         current_streak: effectiveStreak(user),
+        study_year: user.study_year,
         created_at: user.created_at,
         xp: levelInfo.xp,
         level: levelInfo.level,
