@@ -11,7 +11,9 @@ RUN npm install
 
 COPY . .
 
-RUN npx prisma generate
+RUN npx prisma generate \
+    && grep -q "study_year" node_modules/.prisma/client/index.d.ts \
+    && echo "OK: Prisma client includes study_year"
 
 # Compile at BUILD time, not at boot. Before, `nest start` compiled every time
 # the container started; if that compile produced nothing the app crashed with
