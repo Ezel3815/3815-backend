@@ -13,6 +13,7 @@ import { UpdateUserDto } from "src/dtos/users/update-user.dto";
 import { UpdateProfileDto } from "src/dtos/users/update-profile.dto";
 import { UserOutDto, UserProfileOutDto } from "src/dtos/users/user.out-dto";
 import { getLevelInfo } from "src/utils/level.utils";
+import { MOSSAD_YEAR } from "src/utils/study-year";
 import { startOfUtcDay, isSameUtcDay } from "src/utils/date.utils";
 import { getAchievementsForUser } from "src/utils/achievement.utils";
 import {
@@ -108,6 +109,73 @@ export class UsersService {
                 email: "", // never expose other people's emails
                 isFollowing: followingIds.has(u.id),
             }));
+    }
+
+    /// "Mossad": the competition between ALL preparatory-year students, ranked by
+    /// total XP. Unlike the friends leaderboard it is open to everyone with that
+    /// year tag. Only name/username/avatar/xp/level are exposed. Returns the
+    /// top 50 plus the caller's own row (with their real rank) if they are lower.
+    async getMossad(userId: number) {
+        const me = await this.prismaService.user.findUnique({
+            where: { id: userId },
+            select: { study_year: true, xp: true },
+        });
+        const inMossad = me?.study_year === MOSSAD_YEAR;
+
+        const total = await this.prismaService.user.count({
+            where: { study_year: MOSSAD_YEAR, status: "ACTIVE" },
+        });
+        const top = await this.prismaService.user.findMany({
+            where: { study_year: MOSSAD_YEAR, status: "ACTIVE" },
+            orderBy: [{ xp: "desc" }, { id: "asc" }],
+            take: 50,
+        });
+
+        const toRow = (u: User, rank: number) => ({
+            id: u.id,
+            name: u.name,
+            username: u.username,
+            avatar_hair: u.avatar_hair,
+            xp: u.xp,
+            level: getLevelInfo(u.xp).level,
+            isMe: u.id === userId,
+            rank,
+        });
+        const rows = top.map((u, i) => toRow(u, i + 1));
+
+        if (inMossad && !rows.some((r) => r.isMe)) {
+            const meFull = await this.prismaService.user.findUnique({ where: { id: userId } });
+            if (meFull) {
+                const ahead = await this.prismaService.user.count({
+                    where: {
+                        study_year: MOSSAD_YEAR,
+                        status: "ACTIVE",
+                        OR: [
+                            { xp: { gt: meFull.xp } },
+                            { xp: meFull.xp, id: { lt: meFull.id } },
+                        ],
+                    },
+                });
+                rows.push(toRow(meFull, ahead + 1));
+            }
+        }
+        return { in_mossad: inMossad, study_year: me?.study_year ?? null, total, entries: rows };
+    }
+
+    async getStudyYear(userId: number) {
+        const u = await this.prismaService.user.findUnique({
+            where: { id: userId },
+            select: { study_year: true },
+        });
+        return { study_year: u?.study_year ?? null };
+    }
+
+    async setStudyYear(userId: number, studyYear: string) {
+        await this.prismaService.user.update({
+            where: { id: userId },
+            data: { study_year: studyYear },
+        });
+        return { study_year: studyYear };
     }
 
     /// Ranks the requesting user together with everyone they follow, by
