@@ -101,6 +101,7 @@ export class AuthService {
                 email: registerDto.email,
                 name: registerDto.name,
                 username,
+                study_year: registerDto.study_year ?? null,
                 password: md5(registerDto.password),
                 status: UserStatus.ACTIVE,
             },
