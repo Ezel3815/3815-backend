@@ -1,0 +1,5 @@
+-- AlterTable
+ALTER TABLE `User` ADD COLUMN `study_year` VARCHAR(32) NULL;
+
+-- CreateIndex
+CREATE INDEX `User_study_year_xp_idx` ON `User`(`study_year`, `xp`);
