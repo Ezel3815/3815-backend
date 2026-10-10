@@ -1,4 +1,5 @@
-import { IsEmail, IsString, Matches, MaxLength, MinLength } from "class-validator";
+import { IsEmail, IsIn, IsOptional, IsString, Matches, MaxLength, MinLength } from "class-validator";
+import { STUDY_YEARS } from "src/utils/study-year";
 
 
 export class RegisterDto {
@@ -22,4 +23,10 @@ export class RegisterDto {
     @MinLength(6, { message: 'Password must be at least 6 characters long.' })
     @MaxLength(30, { message: 'Password must be at most 30 characters long.' })
     password: string;
+
+    /// Optional so older app versions can still register; the app asks for it.
+    @IsOptional()
+    @IsString()
+    @IsIn(STUDY_YEARS as unknown as string[], { message: "Invalid study year." })
+    study_year?: string;
 }
