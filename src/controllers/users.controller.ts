@@ -22,6 +22,7 @@ import { UpdatePasswordDto } from "src/dtos/users/update-password.dto";
 import { UpdateUserDto } from "src/dtos/users/update-user.dto";
 import { UpdateProfileDto } from "src/dtos/users/update-profile.dto";
 import { UpdateFcmTokenDto } from "src/dtos/users/update-fcm-token.dto";
+import { UpdateStudyYearDto } from "src/dtos/users/update-study-year.dto";
 import { AuthService } from "src/services/auth.service";
 import { UsersService } from "src/services/users.service";
 import { ApiTags } from "@nestjs/swagger";
@@ -129,6 +130,24 @@ export class UsersController {
     @Get("search")
     async search(@DUser() user: User, @Query("q") q: string) {
         return await this.service.searchUsers(q, user.id);
+    }
+
+    @DAuth()
+    @Get("mossad")
+    async mossad(@DUser() user: User) {
+        return await this.service.getMossad(user.id);
+    }
+
+    @DAuth()
+    @Get("me/study-year")
+    async studyYear(@DUser() user: User) {
+        return await this.service.getStudyYear(user.id);
+    }
+
+    @DAuth()
+    @Put("me/study-year")
+    async setStudyYear(@DUser() user: User, @Body() dto: UpdateStudyYearDto) {
+        return await this.service.setStudyYear(user.id, dto.study_year);
     }
 
     @DAuth()
