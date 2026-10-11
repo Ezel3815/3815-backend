@@ -35,6 +35,7 @@ import { UserDeckOutDto } from "src/dtos/decks/user-deck.out-dto";
 import { DecksCardsService } from "./decks-cards.service";
 import { log } from "console";
 import { DeckOutDto } from "src/dtos/decks/deck_out_dto";
+import { CopyFile } from "src/utils/files.utils";
 
 @Injectable()
 export class DecksService {
@@ -365,6 +366,144 @@ async readHierarchy1(user: User, parentId: number | null) {
         if (count == 0) {
             await this.delete(deckId);
         }
+    }
+
+    // Copies a deck with everything inside it (sub-decks, cards, images/PDFs)
+    // into another Decks Package. NOT copied: students' answers/progress, codes
+    // and share links. If anything fails, the partial copy is removed again.
+    async copy(user: User, id: number, targetParentId: number | null) {
+        const source = await this.prismaService.deck.findUnique({ where: { id } });
+        if (!source) GenerateBadRequestException(["Deck not found"]);
+
+        if (targetParentId) {
+            const target = await this.prismaService.deck.findUnique({
+                where: { id: targetParentId },
+            });
+            if (!target) GenerateBadRequestException(["Target deck not found"]);
+            if (target.type !== DeckType.PACKAGE_DECK)
+                GenerateBadRequestException([
+                    "The target must be a Decks Package",
+                ]);
+            // never into itself or one of its own sub-decks
+            let cursor: number | null = targetParentId;
+            for (let i = 0; cursor && i < 50; i++) {
+                if (cursor === id)
+                    GenerateBadRequestException([
+                        "A deck can't be copied into itself or into its own sub-decks",
+                    ]);
+                const up = await this.prismaService.deck.findUnique({
+                    where: { id: cursor },
+                    select: { parent_id: true },
+                });
+                cursor = up?.parent_id ?? null;
+            }
+        }
+
+        const created: number[] = [];
+        try {
+            // copying next to the original: mark it so the two can be told apart
+            const suffix = source.parent_id === targetParentId ? " (copy)" : "";
+            const root = await this.copyTree(user, id, targetParentId, suffix, created, 0);
+            invalidateHierarchy();
+            return { id: root.id, title: root.title, decks: created.length };
+        } catch (e) {
+            for (const deckId of [...created].reverse()) {
+                try {
+                    await this.delete(deckId);
+                } catch {}
+            }
+            invalidateHierarchy();
+            throw e;
+        }
+    }
+
+    private async copyTree(
+        user: User,
+        sourceId: number,
+        parentId: number | null,
+        titleSuffix: string,
+        created: number[],
+        depth: number,
+    ) {
+        if (depth > 20) throw new Error("Deck tree is too deep to copy");
+        const src = await this.prismaService.deck.findUnique({
+            where: { id: sourceId },
+            include: {
+                cards: { orderBy: { order: "asc" } },
+                children: { orderBy: { order: "asc" } },
+            },
+        });
+
+        const deck = await this.prismaService.deck.create({
+            data: {
+                title: src.title + titleSuffix,
+                type: src.type,
+                by_admin: user.role == UserRole.ADMIN,
+                parent_id: parentId,
+                public: src.public,
+                visible: src.visible,
+                order: src.order,
+            },
+        });
+        created.push(deck.id);
+        await this.prismaService.userDeck.create({
+            data: {
+                deck_id: deck.id,
+                user_id: user.id,
+                sharable: true,
+                editable: true,
+            },
+        });
+
+        for (const card of src.cards) await this.copyCard(card, deck.id);
+        for (const child of src.children)
+            await this.copyTree(user, child.id, deck.id, "", created, depth + 1);
+        return deck;
+    }
+
+    private async copyCard(card: any, deckId: number) {
+        // old media name -> new media name (each card needs its own files)
+        const renamed = new Map<string, string | null>();
+        const names = [
+            ...new Set(
+                [card.front_image_name, card.back_image_name, card.document_name].filter(
+                    Boolean,
+                ),
+            ),
+        ] as string[];
+        await Promise.all(
+            names.map(async (name) => {
+                const media = await this.prismaService.media.findUnique({ where: { name } });
+                if (!media) {
+                    renamed.set(name, null); // orphaned reference: nothing to copy
+                    return;
+                }
+                const newName = await CopyFile(name);
+                await this.prismaService.media.create({
+                    data: { name: newName, type: media.type },
+                });
+                renamed.set(name, newName);
+            }),
+        );
+
+        // card.data may mention the old file names: point them at the copies
+        let json = JSON.stringify(card.data ?? null);
+        for (const [oldName, newName] of renamed)
+            if (newName) json = json.split(oldName).join(newName);
+
+        const pick = (n: string | null) => (n ? (renamed.get(n) ?? null) : null);
+        await this.prismaService.card.create({
+            data: {
+                deck_id: deckId,
+                order: card.order,
+                type: card.type,
+                data: JSON.parse(json),
+                document_title: card.document_title,
+                document_name: pick(card.document_name),
+                front_image_name: pick(card.front_image_name),
+                back_image_name: pick(card.back_image_name),
+            },
+        });
     }
 
     async delete(id: number) {
