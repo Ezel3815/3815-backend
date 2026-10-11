@@ -31,6 +31,7 @@ import {
 import { v7 as uuid } from "uuid";
 import * as md5 from "md5";
 import { MosaicService } from "../mosaic/mosaic.service";
+import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 
 // Feed events addressed to ONE person (shown only in that person's feed,
 // no celebrate / comments): "X followed you" and "X reminds you to study".
@@ -974,6 +975,13 @@ b{color:#4f9d69}.open{display:inline-block;background:#4f9d69;color:#fff;padding
             // 6. this user's deck access/edit rights (see note above the method)
             this.prismaService.userDeck.deleteMany({ where: { user_id: id } }),
 
+            // 6b. mosaic progress. These tables reference User WITHOUT a
+            //     cascade, so a user who ever answered a card (and so has
+            //     mosaic rows) could not be deleted before this was added.
+            this.prismaService.mosaicPiece.deleteMany({ where: { user_id: id } }),
+            this.prismaService.mosaicDay.deleteMany({ where: { user_id: id } }),
+            this.prismaService.mosaicSeason.deleteMany({ where: { user_id: id } }),
+
             // 7. quest_partner_id has no DB-level foreign key in this schema
             //    (plain Int?, no @relation), so it can't block the delete —
             //    but clear it anyway so no other user points at a deleted id
@@ -987,5 +995,68 @@ b{color:#4f9d69}.open{display:inline-block;background:#4f9d69;color:#fff;padding
         ]);
 
         return true;
+    }
+
+    // Deletes EVERY non-admin user and all of their data, in one transaction
+    // (all or nothing). Admin accounts are never touched, so the dashboard
+    // can't lock itself out. Same cleanup as delete(), but with relation
+    // filters instead of a single id.
+    async deleteAllUsers() {
+        const nonAdmin = { role: { not: UserRole.ADMIN } };
+
+        const total = await this.prismaService.user.count({ where: nonAdmin });
+        if (total === 0) return { deleted: 0 };
+
+        await this.prismaService.$transaction([
+            // reactions/comments these users left on other people's events
+            this.prismaService.activityReaction.deleteMany({ where: { user: nonAdmin } }),
+            this.prismaService.activityComment.deleteMany({ where: { user: nonAdmin } }),
+
+            // events they authored or were the target of (reactions/comments
+            // on those events go too, via the schema's onDelete: Cascade)
+            this.prismaService.activityEvent.deleteMany({
+                where: { OR: [{ user: nonAdmin }, { target: nonAdmin }] },
+            }),
+
+            this.prismaService.userAchievement.deleteMany({ where: { user: nonAdmin } }),
+            this.prismaService.cardAnswer.deleteMany({ where: { user: nonAdmin } }),
+
+            // follows in both directions
+            this.prismaService.follow.deleteMany({
+                where: { OR: [{ follower: nonAdmin }, { following: nonAdmin }] },
+            }),
+
+            // deck access rows (decks themselves are kept, see note on delete())
+            this.prismaService.userDeck.deleteMany({ where: { user: nonAdmin } }),
+
+            // mosaic progress
+            this.prismaService.mosaicPiece.deleteMany({ where: { user: nonAdmin } }),
+            this.prismaService.mosaicDay.deleteMany({ where: { user: nonAdmin } }),
+            this.prismaService.mosaicSeason.deleteMany({ where: { user: nonAdmin } }),
+
+            this.prismaService.user.deleteMany({ where: nonAdmin }),
+        ]);
+
+        // quest_partner_id has no foreign key, so an admin could still point at
+        // a user that no longer exists. Only admins remain, so this is a tiny query.
+        const remaining = await this.prismaService.user.findMany({
+            select: { id: true, quest_partner_id: true },
+        });
+        const ids = new Set(remaining.map((u) => u.id));
+        const dangling = remaining
+            .filter((u) => u.quest_partner_id !== null && !ids.has(u.quest_partner_id))
+            .map((u) => u.id);
+        if (dangling.length) {
+            await this.prismaService.user.updateMany({
+                where: { id: { in: dangling } },
+                data: { quest_partner_id: null },
+            });
+        }
+
+        // the cached deck lists are per-user; drop them all
+        invalidateHierarchy();
+
+        console.warn(`[ADMIN] deleteAllUsers removed ${total} users`);
+        return { deleted: total };
     }
 }
