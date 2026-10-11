@@ -261,6 +261,48 @@ async readHierarchy1(user: User, parentId: number | null) {
                 "You can't edit a deck that you don't own",
             ]);
 
+        // Moving a deck under a parent: apply the same rule create() already
+        // has. Only a "Decks Package" can hold sub-decks. Before this check the
+        // move was saved silently, but the app treats a Cards Deck as a plain
+        // list of cards (and an EMPTY Cards Deck counts as locked, which hides
+        // everything inside it).
+        if (updateDeckDto.parent_id) {
+            const existing = await this.prismaService.deck.findUnique({
+                where: { id },
+                select: { parent_id: true },
+            });
+            // only check when the parent is actually changing, so editing the
+            // title of an older deck is never blocked
+            if (existing && existing.parent_id !== updateDeckDto.parent_id) {
+                if (updateDeckDto.parent_id === id)
+                    GenerateBadRequestException([
+                        "A deck can't be its own parent",
+                    ]);
+
+                const parent = await this.prismaService.deck.findUnique({
+                    where: { id: updateDeckDto.parent_id },
+                });
+                if (!parent || parent.type != DeckType.PACKAGE_DECK)
+                    GenerateBadRequestException([
+                        "You can't add a sub-deck to this deck. Set its type to Decks Package first (a Cards Deck can only hold cards).",
+                    ]);
+
+                // walk up from the new parent: it must not sit inside this deck
+                let cursor: number | null = parent.parent_id;
+                for (let hops = 0; cursor != null && hops < 50; hops++) {
+                    if (cursor === id)
+                        GenerateBadRequestException([
+                            "A deck can't be moved inside one of its own sub-decks",
+                        ]);
+                    const up = await this.prismaService.deck.findUnique({
+                        where: { id: cursor },
+                        select: { parent_id: true },
+                    });
+                    cursor = up?.parent_id ?? null;
+                }
+            }
+        }
+
         if (updateDeckDto.type) {
             const current = await this.prismaService.deck.findUnique({
                 where: { id },
