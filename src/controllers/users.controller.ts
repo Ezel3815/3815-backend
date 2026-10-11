@@ -20,6 +20,7 @@ import { CreateUserDto } from "src/dtos/users/create-user.dto";
 import { UpdateMeDto } from "src/dtos/users/update-me.dto";
 import { UpdatePasswordDto } from "src/dtos/users/update-password.dto";
 import { UpdateUserDto } from "src/dtos/users/update-user.dto";
+import { DeleteAllUsersDto } from "src/dtos/users/delete-all-users.dto";
 import { UpdateProfileDto } from "src/dtos/users/update-profile.dto";
 import { UpdateFcmTokenDto } from "src/dtos/users/update-fcm-token.dto";
 import { UpdateStudyYearDto } from "src/dtos/users/update-study-year.dto";
@@ -281,6 +282,14 @@ export class UsersController {
     @Delete("me")
     async deleteMe(@DUser() user: User) {
         return await this.service.delete(user.id);
+    }
+
+    // Admin only. Deletes every non-admin user; admins are always kept.
+    // Requires the body { "confirm": "DELETE ALL USERS" }.
+    @DRole()
+    @Post("delete-all")
+    async deleteAll(@Body() _dto: DeleteAllUsersDto) {
+        return await this.service.deleteAllUsers();
     }
 
     @DRole()
