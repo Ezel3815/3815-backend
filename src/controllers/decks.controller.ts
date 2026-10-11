@@ -28,6 +28,7 @@ import { CreateDeckDto } from "src/dtos/decks/create-deck.dto";
 import { UpdateDeckDto } from "src/dtos/decks/update-deck.dto";
 import { ShareDeckDto } from "src/dtos/decks/share-deck.dto";
 import { LinkByShareCodeDto } from "src/dtos/decks/link-by-share-code.dto";
+import { CopyDeckDto } from "src/dtos/decks/copy-deck.dto";
 
 @ApiTags("Deck")
 @Controller("decks")
@@ -80,6 +81,17 @@ export class DecksController {
         @Body() updateDeckDto: UpdateDeckDto,
     ) {
         return await this.service.update(user, id, updateDeckDto);
+    }
+
+    // Admin: copy a deck (its sub-decks, cards and media) into another Decks Package.
+    @DRole()
+    @Post(":id/copy")
+    async copy(
+        @DUser() user: User,
+        @Param("id", ParseIntPipe) id: number,
+        @Body() dto: CopyDeckDto,
+    ) {
+        return await this.service.copy(user, id, dto.parent_id ?? null);
     }
 
     @DRole()
