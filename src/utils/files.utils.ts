@@ -65,6 +65,23 @@ export async function SaveFile(name: string, buffer: Buffer): Promise<string> {
     return result.secure_url;
 }
 
+// Copies a stored image/PDF to a NEW file and returns the new URL. Every card
+// owns its media (names are unique), so a copied card needs its own file:
+// deleting one card must never remove the other card's picture.
+export async function CopyFile(url: string): Promise<string> {
+    if (!url.startsWith("http"))
+        throw new Error(`Cannot copy a file that is not on Cloudinary: ${url}`);
+    const path = url.split("?")[0];
+    const isPdf = path.toLowerCase().includes(".pdf");
+    const ext = isPdf ? "pdf" : (path.split(".").pop() ?? "png");
+    const result = await cloudinary.uploader.upload(url, {
+        public_id: `${uuid()}.${ext}`,
+        resource_type: isPdf ? "raw" : "image",
+        folder: "soalix",
+    });
+    return result.secure_url;
+}
+
 export async function DeleteFile(name: string) {
     if (!name.startsWith("http")) return;
     const isPdf = name.toLowerCase().includes(".pdf");
