@@ -2,6 +2,7 @@ import {
     BadRequestException,
     Body,
     Controller,
+    Delete,
     Get,
     MaxFileSizeValidator,
     NotFoundException,
@@ -13,6 +14,8 @@ import {
     UploadedFile,
     UseInterceptors,
 } from "@nestjs/common";
+import { existsSync } from "fs";
+import { join } from "path";
 import { FileInterceptor } from "@nestjs/platform-express";
 import { ApiConsumes, ApiTags } from "@nestjs/swagger";
 import { CardType, MediaType, Prisma } from "@prisma/client";
@@ -50,6 +53,81 @@ export class ImageRestoreController {
             ids.push(...frontier);
         }
         return ids;
+    }
+
+    // ---- Remove lost pictures (cards are kept, only the dead picture link goes) ----
+    // GET    /image-restore/lost?deck_id=5  -> preview: how many cards/pictures
+    // DELETE /image-restore/lost?deck_id=5  -> clears them
+    // "Lost" = picture name is not a web link AND the file is not on this server.
+    // Occlusion cards are never touched (their pictures hold the masks).
+    private fileExists(name: string) {
+        return [
+            join(process.cwd(), "public", name),
+            join(__dirname, "..", "..", "..", "public", name),
+        ].some((p) => existsSync(p));
+    }
+
+    private async findLost(deckId?: string) {
+        const and: Prisma.CardWhereInput[] = [
+            { type: { not: CardType.OCCLUSION } },
+            {
+                OR: [
+                    { front_image_name: { not: null } },
+                    { back_image_name: { not: null } },
+                ],
+            },
+        ];
+        if (deckId) {
+            const ids = await this.deckAndDescendantIds(Number(deckId));
+            and.push({ deck_id: { in: ids } });
+        }
+        const cards = await this.prisma.card.findMany({
+            where: { AND: and },
+            select: { id: true, front_image_name: true, back_image_name: true },
+        });
+        const lost = (n: string | null) =>
+            !!n && !n.startsWith("http") && !this.fileExists(n);
+        const front: { id: number; name: string }[] = [];
+        const back: { id: number; name: string }[] = [];
+        for (const c of cards) {
+            if (lost(c.front_image_name))
+                front.push({ id: c.id, name: c.front_image_name! });
+            if (lost(c.back_image_name))
+                back.push({ id: c.id, name: c.back_image_name! });
+        }
+        return { front, back };
+    }
+
+    @DRole()
+    @Get("lost")
+    async lostPreview(@Query("deck_id") deckId?: string) {
+        const { front, back } = await this.findLost(deckId);
+        return {
+            cards: new Set([...front, ...back].map((x) => x.id)).size,
+            pictures: front.length + back.length,
+        };
+    }
+
+    @DRole()
+    @Delete("lost")
+    async clearLost(@Query("deck_id") deckId?: string) {
+        const { front, back } = await this.findLost(deckId);
+        if (front.length)
+            await this.prisma.card.updateMany({
+                where: { id: { in: front.map((x) => x.id) } },
+                data: { front_image_name: null },
+            });
+        if (back.length)
+            await this.prisma.card.updateMany({
+                where: { id: { in: back.map((x) => x.id) } },
+                data: { back_image_name: null },
+            });
+        // Remove the now-orphaned Media rows (sequential: tiny DB pool).
+        for (const x of [...front, ...back]) await this.media.delete(x.name);
+        return {
+            cards: new Set([...front, ...back].map((x) => x.id)).size,
+            pictures: front.length + back.length,
+        };
     }
 
     @DRole()
