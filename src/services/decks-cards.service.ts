@@ -156,19 +156,23 @@ export class DecksCardsService {
         });
         const linked = new Set(linkedRows.map((r) => r.deck_id));
 
-        const deny = () => {
-            throw new ForbiddenException("You don't have access to this deck");
+        // The message names the deck and the reason, so "locked" can be traced to
+        // the exact Deck row (public = code-locked, or not an admin deck).
+        const deny = (deckId: number, reason: string) => {
+            throw new ForbiddenException(
+                `You don't have access to this deck (deck ${deckId}: ${reason})`,
+            );
         };
 
         for (const id of ids) {
             const own = decks.get(id);
             if (!own.by_admin) {
-                if (!linked.has(own.id)) deny();
+                if (!linked.has(own.id)) deny(own.id, "not an admin deck and not linked to you");
                 continue;
             }
             let cur = own;
             while (cur) {
-                if (cur.public && !linked.has(cur.id)) deny();
+                if (cur.public && !linked.has(cur.id)) deny(cur.id, "marked public (code-locked) and not linked to you");
                 cur =
                     cur.parent_id !== null ? decks.get(cur.parent_id) : undefined;
             }
