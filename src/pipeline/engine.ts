@@ -15,7 +15,7 @@ export interface Lecture {
     drafts: Draft[]; saved: { q: string; a: string }[]; rejected: string[];
     deckId: number | null; extracted: boolean; rep: LRep;
 }
-export interface Doctor { id: string; name: string; deckId: number | null; lectures: Lecture[] }
+export interface Doctor { id: string; name: string; deckId: number | null; lectures: Lecture[]; styleText?: string; styleFile?: boolean; styleGuide?: string }
 interface Missed { location: string; topic: string; detail: string }
 export interface Cfg {
     subject: string; yearId: number; instructions: string; cardCount: number | null; passes: number;
@@ -255,6 +255,10 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
     }
 
     private reviewPrompt(title: string, part: PCard[], hasSrc: boolean) {
+        return this.reviewPromptBase(title, part, hasSrc) + (this.styleGuide
+            ? `\n\nThis doctor writes his exam questions in a specific style (below). A card that already matches this style is GOOD: do not rewrite it away from the style. Fix a card that ignores the style only when you are also fixing a real problem.\n${this.styleGuide}` : "");
+    }
+    private reviewPromptBase(title: string, part: PCard[], hasSrc: boolean) {
         return `You are a strict senior medical educator reviewing flashcards for the lecture "${title}".${hasSrc ? " The lecture file is attached: check every card against it." : ""}
 For EACH card decide:
 - verdict "keep": the card is clear, correct, tests ONE useful fact. Do NOT rewrite cards only for style.
@@ -323,6 +327,26 @@ Return ONLY JSON: {"pick": 0, "confidence": 90, "reason": "..."}`,
 
 
     // ================= server glue =================
+    styleGuide = "";
+    /** Cards for this doctor's lectures are written (and reviewed) in the way HE asks exam questions. */
+    setStyle(guide: string) {
+        this.styleGuide = guide.trim();
+        this.instructions = (this.cfg.instructions || "") + (this.styleGuide
+            ? `\n\nHOW THIS DOCTOR ASKS EXAM QUESTIONS. Write the cards so they train exactly this: same question forms, same depth, and focus on what he tends to test:\n${this.styleGuide}` : "");
+    }
+    /** Reads the doctor's PREVIOUS questions (pasted text and/or a file) once and turns them into a short style guide. */
+    async buildStyleGuide(doctor: string, text: string, src: { base64: string; mime: string } | null): Promise<string> {
+        const prompt = `Below are PREVIOUS EXAM QUESTIONS written by Dr ${doctor} for the subject "${this.subject}"${src ? " (a file is attached)" : ""}${text.trim() ? ", plus pasted text" : ""}.
+Study how this doctor thinks and write a STYLE GUIDE (max 350 words, same language as the questions) for someone who will turn his lectures into flashcards that prepare students for HIS exam:
+- the question forms he uses (direct recall, MCQ-style, clinical case, compare/contrast, "which is NOT", lists, numbers, images...)
+- how deep and how specific the questions are
+- what kinds of facts he keeps testing (definitions, mechanisms, doses, classifications, exceptions, "first-line", values...) and what he never asks
+- his wording habits and how short or long answers are
+- 3 to 5 short example questions that show the style (copy at most 5, short)
+Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slice(0, 60000)}` : ""}`;
+        const { data } = await this.pool.run((key) => geminiJson({ apiKey: key, model: this.MODEL, prompt, file: src ?? undefined, schema: { type: "OBJECT", properties: { guide: { type: "STRING" } }, required: ["guide"] }, fast: true }), 120e3, { role: "write" });
+        return String((data as any)?.guide || "").slice(0, 3500);
+    }
     // judge: best model first (Claude keys), `pics` = the step looks at pictures
     private ai(prompt: string, schema: any, o: { file?: any; files?: any[]; pics?: boolean; maxTokens?: number } = {}) {
         return this.pool.run((key) => geminiJson({
