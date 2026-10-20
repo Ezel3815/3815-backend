@@ -98,6 +98,60 @@ export class ImageRestoreController {
         return { front, back };
     }
 
+    // ---- Picture overview (Subjects page) ----
+    // GET /image-restore/counts        -> { [deck_id]: { pics, broken } }  (cards that have a picture, and how many are dead links)
+    // GET /image-restore/with-pictures -> the cards that have a picture (deck_id optional, includes nested decks; paged with `after`)
+    private static HAS_PIC: Prisma.CardWhereInput = { OR: [{ front_image_name: { not: null } }, { back_image_name: { not: null } }] };
+    private static names(r: { front_image_name: string | null; back_image_name: string | null }) {
+        return [r.front_image_name, r.back_image_name].filter((n): n is string => !!n && !!n.trim());
+    }
+
+    @DRole()
+    @Get("counts")
+    async picCounts() {
+        const rows = await this.prisma.card.findMany({
+            where: ImageRestoreController.HAS_PIC,
+            select: { deck_id: true, front_image_name: true, back_image_name: true },
+        });
+        const out: Record<number, { pics: number; broken: number }> = {};
+        for (const r of rows) {
+            const n = ImageRestoreController.names(r);
+            if (!n.length) continue;
+            const o = (out[r.deck_id] ??= { pics: 0, broken: 0 });
+            o.pics++;
+            if (n.some((x) => !/^https?:\/\//i.test(x))) o.broken++;
+        }
+        return out;
+    }
+
+    @DRole()
+    @Get("with-pictures")
+    async withPictures(@Query("deck_id") deckId?: string, @Query("after") after?: string, @Query("limit") limit?: string) {
+        const take = Math.min(Math.max(Number(limit) || 50, 1), 100);
+        const and: Prisma.CardWhereInput[] = [ImageRestoreController.HAS_PIC];
+        if (deckId) and.push({ deck_id: { in: await this.deckAndDescendantIds(Number(deckId)) } });
+        if (after) and.push({ id: { gt: Number(after) } });
+        const rows = await this.prisma.card.findMany({
+            where: { AND: and },
+            orderBy: { id: "asc" },
+            take,
+            select: { id: true, deck_id: true, type: true, data: true, front_image_name: true, back_image_name: true },
+        });
+        const decks = await this.prisma.deck.findMany({ where: { id: { in: [...new Set(rows.map((r) => r.deck_id))] } }, select: { id: true, title: true } });
+        const title = new Map(decks.map((d) => [d.id, d.title]));
+        const plain = (h: any) => String(h ?? "").replace(/<[^>]*>/g, " ").replace(/&nbsp;|&[a-z]+;/g, " ").replace(/\s+/g, " ").trim().slice(0, 180);
+        const cards = rows.map((r) => {
+            let d: any = r.data;
+            for (let i = 0; i < 3 && typeof d === "string"; i++) { try { d = JSON.parse(d); } catch { d = null; } }
+            return {
+                id: r.id, deck_id: r.deck_id, deck: title.get(r.deck_id) ?? "", type: r.type,
+                q: plain(d?.front?.text), a: plain(d?.back?.text),
+                front_image: r.front_image_name || null, back_image: r.back_image_name || null,
+            };
+        });
+        return { cards, next: rows.length === take ? rows[rows.length - 1].id : null };
+    }
+
     @DRole()
     @Get("lost")
     async lostPreview(@Query("deck_id") deckId?: string) {
