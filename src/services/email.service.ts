@@ -33,6 +33,11 @@ export class EmailService {
         }
     }
 
+    /** Plain notification (used by the pipeline when a job finishes). */
+    async notify(to: string, subject: string, text: string) {
+        return await this.send(to, subject, text);
+    }
+
     async sendVerificationEmail(user: User) {
         return await this.send(
             user.email,
