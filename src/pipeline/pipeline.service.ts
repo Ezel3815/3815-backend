@@ -192,12 +192,25 @@ export class PipelineService implements OnApplicationBootstrap {
         const t = title.trim();
         const where = { parent_id: parentId, by_admin: true, title: t } as any;
         const hit = await this.prisma.deck.findFirst({ where });
-        if (hit) return hit.id;
+        if (hit) {
+            // subject + doctor are packages, chapters are card decks: never reuse a deck of the wrong kind
+            if (hit.type !== type) throw new Error(`"${t}" already exists here as a ${hit.type === "PACKAGE_DECK" ? "package (folder)" : "card deck"}, but it must be a ${type === "PACKAGE_DECK" ? "package (folder)" : "card deck"}. Rename or delete the old one, then press Resume.`);
+            return hit.id;
+        }
         if (t.length > MAX_TITLE) throw new Error(`"${t}" is ${t.length} characters. Deck names can be at most ${MAX_TITLE}.`);
         await this.decks.create(user, { title: t, type, parent_id: parentId, public: false, visible, order } as any);
-        const made = await this.prisma.deck.findFirst({ where, orderBy: { id: "desc" } });
-        if (!made) throw new Error(`Created "${t}" but could not find it`);
+        const made = await this.prisma.deck.findFirst({ where: { ...where, type }, orderBy: { id: "desc" } });
+        if (!made) throw new Error(`Created "${t}" but could not find it as a ${type}`);
         return made.id;
+    }
+
+    private checkedDecks = new Set<number>();
+    /** Cards may only be added to a card deck (chapter), never to a package (subject / doctor). */
+    private async assertCardsDeck(deckId: number) {
+        if (this.checkedDecks.has(deckId)) return;
+        const d = await this.prisma.deck.findUnique({ where: { id: deckId }, select: { type: true } });
+        if (d?.type !== "CARDS_DECK") throw new Error("Cards can only be added to a card deck (chapter), not to a package.");
+        this.checkedDecks.add(deckId);
     }
 
     private async runJob(id: number): Promise<boolean> {
@@ -217,7 +230,7 @@ export class PipelineService implements OnApplicationBootstrap {
         const io: IO = {
             log: (m) => { log.unshift(`${new Date().toISOString().slice(11, 19)}  ${m}`); persist(); },
             persist,
-            saveCard: async (deckId, q, a) => (await this.cards.create(user, deckId, { type: CardType.BASIC, data: { front: { text: q, size: 14, align: "center" }, back: { text: a, size: 14, align: "center" } } } as any) as any)?.id ?? 0,
+            saveCard: async (deckId, q, a) => (await this.assertCardsDeck(deckId), await this.cards.create(user, deckId, { type: CardType.BASIC, data: { front: { text: q, size: 14, align: "center" }, back: { text: a, size: 14, align: "center" } } } as any) as any)?.id ?? 0,
             loadCards: async (deckId) => {
                 const rows = await this.prisma.card.findMany({ where: { deck_id: deckId }, orderBy: { order: "asc" } });
                 return rows.map((r) => {
