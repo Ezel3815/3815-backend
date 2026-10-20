@@ -6,7 +6,7 @@ import { DecksCardsService } from "src/services/decks-cards.service";
 import { MediaService } from "src/services/media.service";
 import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 import { Cfg, Doctor, Engine, IO, Lecture } from "./engine";
-import { KeyPool, PoolExhausted, PoolStopped, keyLabel } from "./key-pool";
+import { KeyPool, PoolExhausted, PoolStopped, Role, keyLabel } from "./key-pool";
 
 const MAX_TITLE = 15; // the backend refuses deck names longer than this
 const CHUNK = 4 * 1024 * 1024;
@@ -30,13 +30,48 @@ export class PipelineService implements OnApplicationBootstrap {
 
     // After a restart/redeploy of the free server, unfinished jobs continue by themselves.
     onApplicationBootstrap() {
+        this.loadKeys();
         setTimeout(async () => {
             await this.prisma.pipelineJob.updateMany({ where: { status: { in: ["running", "waiting"] } }, data: { status: "queued" } }).catch(() => {});
             this.kick();
         }, 20000);
     }
 
-    keys() { return this.pool.keys.map((k) => ({ label: keyLabel(k.key), role: k.role, state: this.pool.state(k), reason: k.reason, ok: k.ok })); }
+    private dbIds = new Map<string, number>();
+    private async loadKeys() {
+        try {
+            for (const r of await this.prisma.pipelineKey.findMany()) { this.pool.addKeys(r.key, r.role as Role); this.dbIds.set(r.key, r.id); }
+        } catch (e: any) { this.logger.error("keys: " + String(e?.message || e)); }
+    }
+    keys() {
+        return this.pool.keys.map((k) => ({ id: this.dbIds.get(k.key) ?? null, label: keyLabel(k.key), role: k.role, state: this.pool.state(k), reason: k.reason, ok: k.ok }));
+    }
+    /** Keys added from the dashboard are saved in the database, so they survive restarts. */
+    async addKeys(text: string, role: Role) {
+        const r: Role = (["any", "write", "review", "pics"] as Role[]).includes(role) ? role : "any";
+        const list = [...new Set(String(text || "").split(/[\n,;\s]+/).map((x) => x.trim()).filter((x) => x.length > 8))].slice(0, 100);
+        const added = this.pool.addKeys(list.join("\n"), r);
+        for (const key of list) {
+            const row = await this.prisma.pipelineKey.upsert({ where: { key }, update: { role: r }, create: { key, role: r } });
+            this.dbIds.set(key, row.id);
+        }
+        this.kickWaiting();
+        return { added, total: this.pool.keys.length };
+    }
+    async removeKey(id: number) {
+        const row = await this.prisma.pipelineKey.findUnique({ where: { id } });
+        if (!row) throw new NotFoundException("Key not found");
+        await this.prisma.pipelineKey.delete({ where: { id } });
+        this.dbIds.delete(row.key);
+        const k = this.pool.keys.find((x) => x.key === row.key); if (k) this.pool.remove(k);
+        return { ok: true };
+    }
+    /** Gives every key another chance (cooling or marked invalid), and wakes up a waiting job. */
+    reviveKeys() { this.pool.reviveAll(); this.kickWaiting(); return { ok: true }; }
+    private async kickWaiting() {
+        await this.prisma.pipelineJob.updateMany({ where: { status: "waiting" }, data: { status: "queued" } }).catch(() => {});
+        this.kick();
+    }
 
     // ---------------- jobs ----------------
     async create(user: User, body: { title?: string; config: Cfg; doctors: any[] }) {
@@ -197,7 +232,7 @@ export class PipelineService implements OnApplicationBootstrap {
         };
         await this.prisma.pipelineJob.update({ where: { id }, data: { status: "running", message: null } });
         try {
-            if (!this.pool.keys.some((k) => !k.dead)) throw new Error("No AI key on the server. Add AI_KEYS in the Render environment variables.");
+            if (!this.pool.keys.some((k) => !k.dead)) throw new Error("No AI key on the server. Add keys in Pipeline > AI keys.");
             io.log("Preparing folders…");
             st.subjectId = await this.ensureDeck(user, cfg.subject, "PACKAGE_DECK", cfg.yearId, 0, !cfg.hideNew);
             let di = 0;
