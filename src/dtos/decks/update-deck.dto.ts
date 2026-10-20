@@ -15,7 +15,7 @@ import {
 export class UpdateDeckDto {
     @IsOptional()
     @IsString()
-    @MaxLength(30)
+    @MaxLength(60)
     @MinLength(1)
     title: string;
 
