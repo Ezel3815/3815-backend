@@ -34,6 +34,15 @@ export class PipelineService implements OnApplicationBootstrap {
     // After a restart/redeploy of the free server, unfinished jobs continue by themselves.
     onApplicationBootstrap() {
         this.loadKeys();
+        // scheduled jobs: checked every minute (they are stored in the database, so a restart does not lose them)
+        setInterval(async () => {
+            try {
+                const due = (await this.prisma.pipelineJob.findMany({ where: { status: "scheduled" }, select: { id: true, state: true } })).filter((j) => ((j.state as any)?.runAt ?? 0) <= Date.now());
+                if (!due.length) return;
+                await this.prisma.pipelineJob.updateMany({ where: { id: { in: due.map((j) => j.id) } }, data: { status: "queued", message: null } });
+                this.kick();
+            } catch {}
+        }, 60_000);
         setTimeout(async () => {
             await this.prisma.pipelineJob.updateMany({ where: { status: { in: ["running", "waiting"] } }, data: { status: "queued" } }).catch(() => {});
             this.kick();
@@ -130,8 +139,10 @@ export class PipelineService implements OnApplicationBootstrap {
     }
 
     private summary(state: any) {
+        const runAt = state?.runAt ?? null;
         const ls: Lecture[] = (state?.doctors ?? []).flatMap((d: Doctor) => d.lectures);
         return {
+            runAt,
             lectures: ls.map((l) => ({ id: l.id, name: l.name, status: l.status, stage: l.stage, msg: l.msg, progress: l.progress, cards: l.saved.length })),
             done: ls.filter((l) => l.stage === "done").length, total: ls.length, cards: ls.reduce((n, l) => n + l.saved.length, 0),
         };
@@ -142,9 +153,15 @@ export class PipelineService implements OnApplicationBootstrap {
         return { id: j.id, title: j.title, status: j.status, message: j.message, log: j.log, report: j.report, ...this.summary(j.state), updated_at: j.updated_at };
     }
 
-    async start(id: number) {
+    async start(id: number, runAt?: number) {
         const j = await this.get(id);
         const st: any = j.state;
+        if (runAt && runAt > Date.now() + 30_000) {
+            st.runAt = runAt;
+            await this.prisma.pipelineJob.update({ where: { id }, data: { status: "scheduled", message: `Scheduled for ${new Date(runAt).toISOString()}`, state: st } });
+            return { ok: true, scheduled: true };
+        }
+        delete st.runAt;
         for (const l of (st.doctors as Doctor[]).flatMap((d) => d.lectures)) if (l.status === "error") { l.status = l.stage === "written" ? "written" : "queued"; l.msg = ""; }
         await this.prisma.pipelineJob.update({ where: { id }, data: { status: "queued", message: null, state: st } });
         this.kick();
@@ -153,7 +170,7 @@ export class PipelineService implements OnApplicationBootstrap {
 
     async pause(id: number) {
         if (this.currentId === id) this.pool.stopped = true;
-        else await this.prisma.pipelineJob.updateMany({ where: { id, status: { in: ["queued", "waiting"] } }, data: { status: "paused" } });
+        else await this.prisma.pipelineJob.updateMany({ where: { id, status: { in: ["queued", "waiting", "scheduled"] } }, data: { status: "paused" } });
         return { ok: true };
     }
 
