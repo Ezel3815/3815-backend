@@ -88,7 +88,7 @@ export class PipelineService implements OnApplicationBootstrap {
     // ---------------- jobs ----------------
     async create(user: User, body: { title?: string; config: Cfg; doctors: any[] }) {
         const doctors: Doctor[] = (body.doctors ?? []).map((d) => ({
-            id: String(d.id || uid()), name: String(d.name || "").trim(), deckId: null,
+            id: String(d.id || uid()), name: String(d.name || "").trim(), deckId: null, styleText: String(d.styleText || "").slice(0, 80000), styleFile: false,
             lectures: (d.lectures ?? []).map((l: any): Lecture => ({
                 id: String(l.id || uid()), name: String(l.name || "").trim(), fileName: String(l.fileName || ""), size: Number(l.size) || 0,
                 status: "waiting for file", msg: "", progress: "", stage: "queued", drafts: [], saved: [], rejected: [], deckId: null, extracted: false, rep: emptyRep(),
@@ -111,12 +111,15 @@ export class PipelineService implements OnApplicationBootstrap {
     async saveFile(jobId: number, lectureId: string, file: Express.Multer.File) {
         const job = await this.get(jobId);
         const st: any = job.state;
-        const l = (st.doctors as Doctor[]).flatMap((d) => d.lectures).find((x) => x.id === lectureId);
-        if (!l) throw new NotFoundException("Lecture not found");
+        const docs = st.doctors as Doctor[];
+        const isStyle = lectureId.startsWith("style_");
+        const doc = isStyle ? docs.find((x) => "style_" + x.id === lectureId) : null;
+        const l = isStyle ? null : docs.flatMap((d) => d.lectures).find((x) => x.id === lectureId);
+        if (!doc && !l) throw new NotFoundException("Lecture not found");
         await this.prisma.pipelineFile.deleteMany({ where: { job_id: jobId, lecture_id: lectureId } });
         for (let i = 0, seq = 0; i < file.buffer.length; i += CHUNK, seq++)
             await this.prisma.pipelineFile.create({ data: { job_id: jobId, lecture_id: lectureId, seq, mime: file.mimetype, data: file.buffer.subarray(i, i + CHUNK) } });
-        l.status = "queued"; l.fileName = file.originalname; l.size = file.size;
+        if (doc) doc.styleFile = true; else { l!.status = "queued"; l!.fileName = file.originalname; l!.size = file.size; }
         await this.prisma.pipelineJob.update({ where: { id: jobId }, data: { state: st } });
         return { ok: true };
     }
@@ -277,7 +280,20 @@ export class PipelineService implements OnApplicationBootstrap {
             }
             persist();
             const engine = new Engine(this.pool, cfg, io);
-            for (const d of doctors) for (const l of d.lectures) {
+            for (const d of doctors) {
+                if (d.lectures.some((x) => x.stage !== "done") && !d.styleGuide && (d.styleText?.trim() || d.styleFile)) {
+                    try {
+                        const sf = d.styleFile ? await this.loadFile(id, `style_${d.id}`) : null;
+                        d.styleGuide = await engine.buildStyleGuide(d.name, d.styleText || "", sf);
+                        io.log(`Dr ${d.name}: exam style learned from the previous questions`);
+                        await this.prisma.pipelineFile.deleteMany({ where: { job_id: id, lecture_id: `style_${d.id}` } }); persist();
+                    } catch (e: any) {
+                        if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e;
+                        io.log(`Dr ${d.name}: could not learn the style (${String(e?.message || e)}). Continuing without it.`);
+                    }
+                }
+                engine.setStyle(d.styleGuide || "");
+                for (const l of d.lectures) {
                 if (l.stage === "done" || l.deckId == null) continue;
                 if (this.pool.stopped) throw new PoolStopped("Paused");
                 const src = await this.loadFile(id, l.id);
@@ -290,6 +306,7 @@ export class PipelineService implements OnApplicationBootstrap {
                     l.status = "error"; l.msg = String(e?.message || e); io.log(`${l.name}: ${l.msg}`);
                 }
                 persist();
+                }
             }
             if (cfg.hideNew && doctors.every((d) => d.lectures.every((l) => l.stage === "done"))) {
                 const ids = [st.subjectId, ...doctors.flatMap((d) => [d.deckId, ...d.lectures.map((l) => l.deckId)])].filter((x) => x != null);
@@ -348,6 +365,7 @@ export class PipelineService implements OnApplicationBootstrap {
                 fixed: sum((l) => l.rep?.fixes?.length ?? 0), deleted: sum((l) => l.rep?.deleted?.length ?? 0),
                 pictures: sum((l) => l.rep?.pictures?.length ?? 0), noPicture: sum((l) => l.rep?.noPicture?.length ?? 0), attention: sum((l) => l.rep?.lowConf?.length ?? 0),
             },
+            styles: (st.doctors as Doctor[]).filter((d) => d.styleGuide).map((d) => ({ doctor: d.name, guide: d.styleGuide })),
             lectures: ls.map(({ d, l }) => ({ doctor: d.name, name: l.name, status: l.stage === "done" ? "done" : l.status, error: l.stage === "done" ? "" : l.msg, cards: l.saved.length, ...l.rep })),
             keys: this.keys(),
         };
