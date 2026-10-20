@@ -30,7 +30,7 @@ export class PipelineController {
         @UploadedFile(new ParseFilePipe({ validators: [new MaxFileSizeValidator({ maxSize: 18 * 1024 * 1024 })] })) file: Express.Multer.File,
     ) { return this.s.saveFile(id, lectureId, file); }
 
-    @DRole() @Post("jobs/:id/start") start(@Param("id", ParseIntPipe) id: number) { return this.s.start(id); }
+    @DRole() @Post("jobs/:id/start") start(@Param("id", ParseIntPipe) id: number, @Body() b: { runAt?: number }) { return this.s.start(id, b?.runAt ? Number(b.runAt) : undefined); }
     @DRole() @Post("jobs/:id/pause") pause(@Param("id", ParseIntPipe) id: number) { return this.s.pause(id); }
     @DRole() @Delete("jobs/:id") remove(@Param("id", ParseIntPipe) id: number) { return this.s.remove(id); }
 }
