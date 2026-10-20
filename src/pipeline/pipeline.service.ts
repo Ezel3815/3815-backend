@@ -4,6 +4,7 @@ import { PrismaService } from "nestjs-prisma";
 import { DecksService } from "src/services/decks.service";
 import { DecksCardsService } from "src/services/decks-cards.service";
 import { MediaService } from "src/services/media.service";
+import { EmailService } from "src/services/email.service";
 import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 import { Cfg, Doctor, Engine, IO, Lecture } from "./engine";
 import { KeyPool, PoolExhausted, PoolStopped, Role, keyLabel } from "./key-pool";
@@ -18,6 +19,7 @@ export class PipelineService implements OnApplicationBootstrap {
     private readonly logger = new Logger("Pipeline");
     private pool = KeyPool.fromEnv();
     private busy = false;
+    private waitMailed = new Set<number>();
     private currentId: number | null = null;
     private retry?: NodeJS.Timeout;
 
@@ -26,6 +28,7 @@ export class PipelineService implements OnApplicationBootstrap {
         private decks: DecksService,
         private cards: DecksCardsService,
         private media: MediaService,
+        private email: EmailService,
     ) {}
 
     // After a restart/redeploy of the free server, unfinished jobs continue by themselves.
@@ -264,15 +267,40 @@ export class PipelineService implements OnApplicationBootstrap {
             }
             const failed = doctors.some((d) => d.lectures.some((l) => l.stage !== "done"));
             clearTimeout(timer);
-            await this.finish(id, "done", failed ? "Finished with some lectures failed: see the report, then press Resume." : "Finished.", st, log, this.buildReport(job.title, st, cfg));
+            const doneMsg = failed ? "Finished with some lectures failed: see the report, then press Resume." : "Finished.";
+            const rep = this.buildReport(job.title, st, cfg);
+            await this.finish(id, "done", doneMsg, st, log, rep);
+            this.waitMailed.delete(id);
+            await this.notify(user, job.title, "done", doneMsg, rep);
             return true;
         } catch (e: any) {
             clearTimeout(timer);
             if (e instanceof PoolStopped) { await this.finish(id, "paused", "Paused.", st, log); return false; }
-            if (e instanceof PoolExhausted) { await this.finish(id, "waiting", `${e.message} It continues by itself in about 20 minutes.`, st, log); this.scheduleRetry(); return false; }
-            await this.finish(id, "error", String(e?.message || e), st, log, this.buildReport(job.title, st, cfg));
+            if (e instanceof PoolExhausted) {
+                const m = `${e.message} It continues by itself in about 20 minutes. Add more keys in Pipeline > AI keys to speed it up.`;
+                await this.finish(id, "waiting", m, st, log); this.scheduleRetry();
+                if (!this.waitMailed.has(id)) { this.waitMailed.add(id); await this.notify(user, job.title, "waiting", m); } // one email per job, not one every retry
+                return false;
+            }
+            const rep = this.buildReport(job.title, st, cfg), em = String(e?.message || e);
+            await this.finish(id, "error", em, st, log, rep);
+            await this.notify(user, job.title, "error", em, rep);
             return true;
         } finally { this.pool.stopped = false; }
+    }
+
+    /** Email to the admin who started the job: finished, stopped by an error, or waiting for AI keys. */
+    private async notify(user: User, title: string, status: string, message: string, report?: any) {
+        try {
+            if (!user.email) return;
+            const t = report?.totals;
+            const lines = [`Job: ${title}`, `Status: ${status}`, message];
+            if (t) lines.push("", `Lectures: ${t.lecturesDone}/${t.lectures}`, `Cards: ${t.cards}`, `Fixed: ${t.fixed}`, `Deleted: ${t.deleted}`, `Pictures added: ${t.pictures}`, `Need your attention: ${t.attention}`);
+            for (const l of report?.lectures ?? []) if (l.error) lines.push(`Problem in "${l.name}": ${l.error}`);
+            const url = process.env.DASHBOARD_URL; lines.push("", url ? `Open the report: ${url.replace(/\/$/, "")}/pipeline` : "Open the dashboard > Pipeline to see the full report.");
+            const subject = status === "done" ? `✅ Pipeline finished: ${title}` : status === "waiting" ? `⏸ Pipeline waiting for AI keys: ${title}` : `⚠️ Pipeline stopped: ${title}`;
+            await this.email.notify(user.email, subject, lines.join("\n"));
+        } catch {}
     }
 
     private async finish(id: number, status: string, message: string, state: any, log?: string[], report?: any) {
