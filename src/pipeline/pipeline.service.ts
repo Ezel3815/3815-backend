@@ -9,7 +9,7 @@ import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 import { Cfg, Doctor, Engine, IO, Lecture } from "./engine";
 import { KeyPool, PoolExhausted, PoolStopped, Role, keyLabel } from "./key-pool";
 
-const MAX_TITLE = 15; // the backend refuses deck names longer than this
+const MAX_TITLE = 60; // longest deck name allowed (same limit as the deck DTOs)
 const CHUNK = 4 * 1024 * 1024;
 const uid = () => Math.random().toString(36).slice(2, 9);
 const emptyRep = () => ({ fixes: [], deleted: [], pictures: [], noPicture: [], lowConf: [] });
