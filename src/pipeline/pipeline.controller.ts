@@ -13,6 +13,9 @@ export class PipelineController {
     constructor(private s: PipelineService) {}
 
     @DRole() @Get("keys") keys() { return this.s.keys(); }
+    @DRole() @Post("keys") addKeys(@Body() b: { text: string; role: any }) { return this.s.addKeys(b.text, b.role); }
+    @DRole() @Post("keys/revive") revive() { return this.s.reviveKeys(); }
+    @DRole() @Delete("keys/:id") removeKey(@Param("id", ParseIntPipe) id: number) { return this.s.removeKey(id); }
     @DRole() @Get("jobs") list() { return this.s.list(); }
     @DRole() @Get("jobs/:id") detail(@Param("id", ParseIntPipe) id: number) { return this.s.detail(id); }
     @DRole() @Post("jobs") create(@DUser() user: User, @Body() body: any) { return this.s.create(user, body); }
