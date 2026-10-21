@@ -2,7 +2,7 @@
 // Server-side pipeline engine. The prompts and the card logic are the SAME as the dashboard pages
 // "Auto Import" (create cards) and "Auto Polish" (review / fix / duplicates / pictures); only the
 // browser parts (localStorage, canvas, background-removal model) were replaced by server code.
-import sharp from "sharp";
+import sharp = require("sharp");
 import { cleanCardHtml } from "./card-html";
 import { geminiJson } from "./gemini-json";
 import { KeyPool, PoolExhausted, PoolStopped, isClaudeKey, canSeePictures } from "./key-pool";
