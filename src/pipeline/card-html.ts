@@ -1,4 +1,4 @@
-import sanitizeHtml from "sanitize-html";
+import sanitizeHtml = require("sanitize-html");
 // Cards store simple HTML (<b>, <i>, <u>, <br>, <span style="color:#...">). Everything else is removed.
 export function cleanCardHtml(raw: string): string {
     return sanitizeHtml(raw ?? "", {
