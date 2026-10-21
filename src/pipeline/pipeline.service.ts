@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException, OnApplicationBootstrap } from "@nestjs/common";
+import { BadRequestException, Injectable, Logger, NotFoundException, OnApplicationBootstrap } from "@nestjs/common";
 import { CardType, MediaType, User } from "@prisma/client";
 import { PrismaService } from "nestjs-prisma";
 import { DecksService } from "src/services/decks.service";
@@ -11,6 +11,14 @@ import { KeyPool, PoolExhausted, PoolStopped, Role, keyLabel } from "./key-pool"
 
 const MAX_TITLE = 60; // longest deck name allowed (same limit as the deck DTOs)
 const CHUNK = 4 * 1024 * 1024;
+/** Looks at the first bytes to find out what the file REALLY is (the name and browser type can be wrong). */
+function sniff(buf: Buffer): string | null {
+    if (buf.subarray(0, 1024).includes("%PDF-")) return "application/pdf";
+    if (buf[0] === 0x89 && buf.subarray(1, 4).toString("latin1") === "PNG") return "image/png";
+    if (buf[0] === 0xff && buf[1] === 0xd8) return "image/jpeg";
+    if (buf.subarray(0, 4).toString("latin1") === "RIFF" && buf.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+    return null;
+}
 const uid = () => Math.random().toString(36).slice(2, 9);
 const emptyRep = () => ({ fixes: [], deleted: [], pictures: [], noPicture: [], lowConf: [] });
 
@@ -109,6 +117,13 @@ export class PipelineService implements OnApplicationBootstrap {
     }
 
     async saveFile(jobId: number, lectureId: string, file: Express.Multer.File) {
+        const mime = sniff(file.buffer);
+        if (!mime) {
+            const head = file.buffer.subarray(0, 300).toString("utf8").trimStart().toLowerCase();
+            throw new BadRequestException(head.startsWith("<")
+                ? `"${file.originalname}" is an HTML web page with a .pdf name (usually a failed download or an error page from Drive/Telegram). Download the real PDF again.`
+                : `"${file.originalname}" is not a PDF or an image.`);
+        }
         const job = await this.get(jobId);
         const st: any = job.state;
         const docs = st.doctors as Doctor[];
@@ -118,7 +133,7 @@ export class PipelineService implements OnApplicationBootstrap {
         if (!doc && !l) throw new NotFoundException("Lecture not found");
         await this.prisma.pipelineFile.deleteMany({ where: { job_id: jobId, lecture_id: lectureId } });
         for (let i = 0, seq = 0; i < file.buffer.length; i += CHUNK, seq++)
-            await this.prisma.pipelineFile.create({ data: { job_id: jobId, lecture_id: lectureId, seq, mime: file.mimetype, data: file.buffer.subarray(i, i + CHUNK) } });
+            await this.prisma.pipelineFile.create({ data: { job_id: jobId, lecture_id: lectureId, seq, mime, data: file.buffer.subarray(i, i + CHUNK) } });
         if (doc) doc.styleFile = true; else { l!.status = "queued"; l!.fileName = file.originalname; l!.size = file.size; }
         await this.prisma.pipelineJob.update({ where: { id: jobId }, data: { state: st } });
         return { ok: true };
