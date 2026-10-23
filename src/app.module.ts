@@ -33,6 +33,10 @@ import { BackupController } from "./controllers/backup.controller";
 import { BackupService } from "./services/backup.service";
 import { PipelineController } from "./pipeline/pipeline.controller";
 import { PipelineService } from "./pipeline/pipeline.service";
+import { AiController } from "./ai/ai.controller";
+import { AiService } from "./ai/ai.service";
+import { QuizService } from "./ai/quiz.service";
+import { PaymentsService } from "./ai/payments.service";
 import { NotificationsService } from "./services/notifications.service";
 
 @Module({
@@ -59,6 +63,7 @@ import { NotificationsService } from "./services/notifications.service";
         NotificationsController,
         BackupController,
         PipelineController,
+        AiController,
     ],
     providers: [
         AppService,
@@ -72,6 +77,9 @@ import { NotificationsService } from "./services/notifications.service";
         MosaicService,
         NotificationsService,
         PipelineService,
+        AiService,
+        QuizService,
+        PaymentsService,
         BackupService,
     ],
 })
