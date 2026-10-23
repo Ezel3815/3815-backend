@@ -6,6 +6,8 @@ import { geminiJson } from "src/pipeline/gemini-json";
 import { KeyPool, PoolExhausted, canSeePictures } from "src/pipeline/key-pool";
 import { cleanCardHtml } from "src/pipeline/card-html";
 import { QuizService } from "./quiz.service";
+import sharp = require("sharp");
+import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 
 export type AiMode = "flashcards" | "mcq";
 
@@ -75,14 +77,21 @@ export class AiService {
     }
 
     // ---------- scan ----------
-    async scan(user: User, files: Express.Multer.File[], opts: { mode: AiMode; count: number; language?: string; instructions?: string; deckId?: number; title?: string }) {
+    async scan(user: User, files: Express.Multer.File[], opts: { mode: AiMode; count: number; language?: string; instructions?: string; deckId?: number; title?: string; deckTitle?: string }) {
         if (!files?.length) GenerateBadRequestException(["Attach at least one photo."]);
         if (!this.pool.keys.some((k) => !k.dead)) throw new HttpException({ statusCode: 503, message: "AI is not configured on the server." }, 503);
         if (opts.deckId && opts.mode === "flashcards") await this.assertOwnDeck(user.id, opts.deckId);
 
         const usageId = await this.reserve(user.id, opts.mode);
         try {
-            const [first, ...rest] = files.map((f) => ({ base64: f.buffer.toString("base64"), mime: f.mimetype }));
+            // shrink photos first: far fewer bytes/tokens for the AI = much faster, and 1600px is plenty to read a page
+            const imgs = await Promise.all(files.map(async (f) => {
+                try {
+                    const b = await sharp(f.buffer).rotate().resize(1600, 1600, { fit: "inside", withoutEnlargement: true }).jpeg({ quality: 80 }).toBuffer();
+                    return { base64: b.toString("base64"), mime: "image/jpeg" };
+                } catch { return { base64: f.buffer.toString("base64"), mime: f.mimetype }; }
+            }));
+            const [first, ...rest] = imgs;
             const { data } = await this.pool.run(
                 (key) => geminiJson({ apiKey: key, model: this.MODEL, prompt: this.prompt(opts), file: first, files: rest, schema: this.schema(opts.mode), maxTokens: 8192, fast: true }),
                 30e3, { only: canSeePictures, onlyMsg: "No key that can read pictures." },
@@ -92,8 +101,10 @@ export class AiService {
 
             let saved = 0, quizId: number | null = null;
             if (opts.mode === "mcq") { if (opts.title) quizId = (await this.quizzes.create(user.id, opts.title, items)).id; }
-            else if (opts.deckId) saved = await this.saveToDeck(opts.deckId, opts.mode, items);
-            return { mode: opts.mode, items, quiz_id: quizId, saved_to_deck: opts.deckId ?? null, saved, status: await this.status(user.id) };
+            let deckId = opts.deckId ?? null;
+            if (opts.mode === "flashcards" && !deckId && opts.deckTitle) deckId = await this.newDeck(user, opts.deckTitle); // started from the library "+": make a deck for the cards
+            if (opts.mode === "flashcards" && deckId) saved = await this.saveToDeck(deckId, opts.mode, items);
+            return { mode: opts.mode, items, quiz_id: quizId, saved_to_deck: deckId, saved, status: await this.status(user.id) };
         } catch (e: any) {
             await this.prisma.aiUsage.delete({ where: { id: usageId } }).catch(() => {}); // failed scans don't cost a try
             if (e instanceof HttpException) throw e;
@@ -131,6 +142,13 @@ export class AiService {
             }
         }
         return out;
+    }
+
+    private async newDeck(user: User, title: string) {
+        const deck = await this.prisma.deck.create({ data: { title: title.trim().slice(0, 60) || "AI", type: "CARDS_DECK", by_admin: user.role === "ADMIN", public: false, visible: true } });
+        await this.prisma.userDeck.create({ data: { deck_id: deck.id, user_id: user.id, sharable: true, editable: true } });
+        invalidateHierarchy();
+        return deck.id;
     }
 
     // ---------- saving into a deck (existing BASIC card format; there is no MCQ card type in the app yet) ----------
