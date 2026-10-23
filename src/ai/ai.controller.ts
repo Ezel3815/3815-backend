@@ -30,13 +30,13 @@ export class AiController {
     scan(
         @DUser() user: User,
         @UploadedFiles(new ParseFilePipe({ validators: [new MaxFileSizeValidator({ maxSize: 8 * 1024 * 1024 }), new FileTypeValidator({ fileType: /^image\/(jpeg|png|webp|heic|heif)$/ })] })) files: Express.Multer.File[],
-        @Body() b: { mode?: string; count?: string; language?: string; instructions?: string; deck_id?: string; title?: string },
+        @Body() b: { mode?: string; count?: string; language?: string; instructions?: string; deck_id?: string; title?: string; deck_title?: string },
     ) {
         if (b.mode !== "flashcards" && b.mode !== "mcq") GenerateBadRequestException(["mode must be 'flashcards' or 'mcq'."]);
         const count = Math.min(20, Math.max(1, Math.floor(Number(b.count)) || 10));
         const deckId = b.deck_id ? Number(b.deck_id) : undefined;
         if (b.deck_id && !Number.isInteger(deckId)) GenerateBadRequestException(["Invalid deck_id."]);
-        return this.s.scan(user, files, { mode: b.mode as any, count, language: b.language?.slice(0, 40), instructions: b.instructions, deckId, title: b.title?.slice(0, 150) });
+        return this.s.scan(user, files, { mode: b.mode as any, count, language: b.language?.slice(0, 40), instructions: b.instructions, deckId, title: b.title?.slice(0, 150), deckTitle: b.deck_title?.slice(0, 60) });
     }
 
     // ---- admin: manual grant (until store billing is wired) ----
