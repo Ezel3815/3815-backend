@@ -99,12 +99,8 @@ export class AiService {
             const items = this.clean(opts.mode, Array.isArray(data) ? data : data?.items ?? []).slice(0, opts.count);
             if (!items.length) throw new HttpException({ statusCode: 422, message: "Couldn't find readable study content in the photo. Try a clearer, closer picture." }, 422);
 
-            let saved = 0, quizId: number | null = null;
-            if (opts.mode === "mcq") { if (opts.title) quizId = (await this.quizzes.create(user.id, opts.title, items)).id; }
-            let deckId = opts.deckId ?? null;
-            if (opts.mode === "flashcards" && !deckId && opts.deckTitle) deckId = await this.newDeck(user, opts.deckTitle); // started from the library "+": make a deck for the cards
-            if (opts.mode === "flashcards" && deckId) saved = await this.saveToDeck(deckId, opts.mode, items);
-            return { mode: opts.mode, items, quiz_id: quizId, saved_to_deck: deckId, saved, status: await this.status(user.id) };
+            // Nothing is saved here: the student reviews the result and chooses Keep or Delete (see keepFlashcards / keepQuiz).
+            return { mode: opts.mode, items, quiz_id: null, saved_to_deck: null, saved: 0, status: await this.status(user.id) };
         } catch (e: any) {
             await this.prisma.aiUsage.delete({ where: { id: usageId } }).catch(() => {}); // failed scans don't cost a try
             if (e instanceof HttpException) throw e;
@@ -142,6 +138,24 @@ export class AiService {
             }
         }
         return out;
+    }
+
+    /** "Keep" on reviewed flashcards: saves them as normal BASIC cards, into [deckId] or into a new deck named [deckTitle]. */
+    async keepFlashcards(user: User, b: { deckId?: number; deckTitle?: string; items: any[] }) {
+        const items = this.clean("flashcards", Array.isArray(b.items) ? b.items : []).slice(0, 60);
+        if (!items.length) GenerateBadRequestException(["No cards to save."]);
+        let deckId = b.deckId ?? null;
+        if (deckId) await this.assertOwnDeck(user.id, deckId);
+        else deckId = await this.newDeck(user, b.deckTitle || "AI");
+        const saved = await this.saveToDeck(deckId, "flashcards", items);
+        invalidateHierarchy();
+        return { deck_id: deckId, saved };
+    }
+    async keepQuiz(user: User, b: { title?: string; items: any[] }) {
+        const items = this.clean("mcq", Array.isArray(b.items) ? b.items : []).slice(0, 60);
+        if (!items.length) GenerateBadRequestException(["No questions to save."]);
+        const q = await this.quizzes.create(user.id, b.title || "Quiz", items);
+        return { quiz_id: q.id, saved: items.length };
     }
 
     private async newDeck(user: User, title: string) {
