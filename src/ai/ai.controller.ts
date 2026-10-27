@@ -48,6 +48,14 @@ export class AiController {
     @DRole() @Delete("subscriptions/:userId")
     revoke(@Param("userId", ParseIntPipe) userId: number) { return this.s.revoke(userId); }
 
+    // ---- "Keep" after reviewing a scan result ----
+    @DAuth() @Post("flashcards/keep")
+    keepCards(@DUser() u: User, @Body() b: { deck_id?: number; deck_title?: string; items: any[] }) {
+        return this.s.keepFlashcards(u, { deckId: b.deck_id ? Number(b.deck_id) : undefined, deckTitle: b.deck_title?.slice(0, 60), items: b.items });
+    }
+    @DAuth() @Post("quizzes/keep")
+    keepQuizItems(@DUser() u: User, @Body() b: { title?: string; items: any[] }) { return this.s.keepQuiz(u, { title: b.title?.slice(0, 150), items: b.items }); }
+
     // ---- MCQ quizzes ----
     @DAuth() @Get("quizzes") quizzes(@DUser() u: User) { return this.quiz.list(u.id); }
     @DAuth() @Get("quizzes/:id") quizGet(@DUser() u: User, @Param("id", ParseIntPipe) id: number) { return this.quiz.get(u.id, id); }
