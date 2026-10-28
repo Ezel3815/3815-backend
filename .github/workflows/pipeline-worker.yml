@@ -28,7 +28,11 @@ jobs:
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
       DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
-      GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+      AI_KEYS: ${{ secrets.AI_KEYS }}
+      AI_KEYS_WRITE: ${{ secrets.AI_KEYS_WRITE }}
+      AI_KEYS_REVIEW: ${{ secrets.AI_KEYS_REVIEW }}
+      AI_KEYS_PICS: ${{ secrets.AI_KEYS_PICS }}
+      AI_BORROW: ${{ secrets.AI_BORROW }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
