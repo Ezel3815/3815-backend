@@ -42,6 +42,8 @@ export class PipelineService implements OnApplicationBootstrap {
     // After a restart/redeploy of the free server, unfinished jobs continue by themselves.
     onApplicationBootstrap() {
         this.loadKeys();
+        // PIPELINE_RUNNER=off -> this server only stores jobs; the GitHub Actions worker runs them.
+        if (this.runnerOff() || process.env.PIPELINE_WORKER === "1") return;
         // scheduled jobs: checked every minute (they are stored in the database, so a restart does not lose them)
         setInterval(async () => {
             try {
@@ -55,6 +57,36 @@ export class PipelineService implements OnApplicationBootstrap {
             await this.prisma.pipelineJob.updateMany({ where: { status: { in: ["running", "waiting"] } }, data: { status: "queued" } }).catch(() => {});
             this.kick();
         }, 20000);
+    }
+
+    private runnerOff() { return process.env.PIPELINE_RUNNER === "off"; }
+
+    /** Standalone mode (GitHub Actions): runs queued jobs, then exits. Stops itself before maxMs so the next run continues. */
+    async runAsWorker(maxMs: number) {
+        await this.loadKeys();
+        const p = this.prisma.pipelineJob;
+        await p.updateMany({ where: { status: "running" }, data: { status: "queued" } }); // left over from a stopped run (only one worker runs at a time)
+        await p.updateMany({ where: { status: "waiting", updated_at: { lt: new Date(Date.now() - 20 * 60 * 1000) } }, data: { status: "queued" } });
+        const due = (await p.findMany({ where: { status: "scheduled" }, select: { id: true, state: true } })).filter((j) => ((j.state as any)?.runAt ?? 0) <= Date.now());
+        if (due.length) await p.updateMany({ where: { id: { in: due.map((j) => j.id) } }, data: { status: "queued", message: null } });
+        let timeUp = false, lastId = 0;
+        const limit = setTimeout(() => { timeUp = true; this.pool.stopped = true; }, maxMs);
+        const watch = setInterval(async () => { // pause / delete pressed in the dashboard
+            if (this.currentId == null) return;
+            const j = await p.findUnique({ where: { id: this.currentId }, select: { status: true } }).catch(() => undefined);
+            if (j === null || j?.status === "paused") this.pool.stopped = true;
+        }, 15_000);
+        try {
+            while (!timeUp) {
+                const job = await p.findFirst({ where: { status: { in: ["queued", "running"] } }, orderBy: { id: "asc" } });
+                if (!job) { this.logger.log("No queued jobs."); break; }
+                lastId = job.id;
+                const again = await this.runJob(job.id);
+                this.currentId = null;
+                if (!again) break;
+            }
+        } finally { clearTimeout(limit); clearInterval(watch); clearTimeout(this.retry); }
+        if (timeUp && lastId) await p.updateMany({ where: { id: lastId, status: "paused" }, data: { status: "queued", message: null } }); // time limit, not the admin: continue next run
     }
 
     private dbIds = new Map<string, number>();
@@ -188,7 +220,7 @@ export class PipelineService implements OnApplicationBootstrap {
 
     async pause(id: number) {
         if (this.currentId === id) this.pool.stopped = true;
-        else await this.prisma.pipelineJob.updateMany({ where: { id, status: { in: ["queued", "waiting", "scheduled"] } }, data: { status: "paused" } });
+        else await this.prisma.pipelineJob.updateMany({ where: { id, status: { in: this.runnerOff() ? ["queued", "waiting", "scheduled", "running"] : ["queued", "waiting", "scheduled"] } }, data: { status: "paused" } });
         return { ok: true };
     }
 
@@ -200,7 +232,7 @@ export class PipelineService implements OnApplicationBootstrap {
 
     // ---------------- runner (one job at a time: the free server is small) ----------------
     kick() {
-        if (this.busy) return;
+        if (this.busy || this.runnerOff()) return;
         this.busy = true;
         (async () => {
             try {
