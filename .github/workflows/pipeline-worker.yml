@@ -1,0 +1,41 @@
+name: Pipeline worker (AI cards)
+
+# Runs the AI pipeline jobs here instead of on the Render student server.
+# Manual button, plus a check every 15 min that exits in seconds when nothing is queued.
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: pipeline-worker
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+      CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+      CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+      JWT_SECRET: ${{ secrets.JWT_SECRET }}
+      FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+      GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm install
+      - run: npx prisma generate
+      - run: npm run build
+      - run: node dist/src/pipeline/worker.js
