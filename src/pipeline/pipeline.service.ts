@@ -139,7 +139,7 @@ export class PipelineService implements OnApplicationBootstrap {
             subject: String(c.subject || "").trim(), yearId: Number(c.yearId), instructions: String(c.instructions || ""),
             cardCount: c.cardCount ? Math.floor(Number(c.cardCount)) : null, passes: Math.max(0, Math.min(2, Number(c.passes ?? 1))),
             colorize: c.colorize !== false, mainColor: c.mainColor || "#009688", hiColor: c.hiColor || "#673ab7", hideNew: !!c.hideNew,
-            threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92,
+            threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
             polishWithFile: c.polishWithFile !== false, cutout: c.cutout !== false,
         };
         const job = await this.prisma.pipelineJob.create({
@@ -406,7 +406,7 @@ export class PipelineService implements OnApplicationBootstrap {
         const sum = (f: (l: Lecture) => number) => ls.reduce((n, { l }) => n + f(l), 0);
         return {
             title, subject: cfg.subject, finishedAt: new Date().toISOString(), startedAt: new Date(st.createdAt || Date.now()).toISOString(),
-            settings: { threshold: cfg.threshold, deleteThreshold: cfg.deleteThreshold, passes: cfg.passes, checkedAgainstFile: cfg.polishWithFile },
+            settings: { threshold: cfg.threshold, pictureThreshold: cfg.pictureThreshold ?? cfg.threshold, deleteThreshold: cfg.deleteThreshold, passes: cfg.passes, checkedAgainstFile: cfg.polishWithFile },
             totals: {
                 lectures: ls.length, lecturesDone: ls.filter(({ l }) => l.stage === "done").length, cards: sum((l) => l.saved.length),
                 fixed: sum((l) => l.rep?.fixes?.length ?? 0), deleted: sum((l) => l.rep?.deleted?.length ?? 0),
