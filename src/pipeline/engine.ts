@@ -20,7 +20,7 @@ interface Missed { location: string; topic: string; detail: string }
 export interface Cfg {
     subject: string; yearId: number; instructions: string; cardCount: number | null; passes: number;
     colorize: boolean; mainColor: string; hiColor: string; hideNew: boolean;
-    threshold: number; deleteThreshold: number; polishWithFile: boolean; cutout: boolean;
+    threshold: number; deleteThreshold: number; pictureThreshold?: number; polishWithFile: boolean; cutout: boolean;
 }
 export interface IO {
     log(m: string): void; persist(): void;
@@ -238,8 +238,8 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
                         const nq = cleanCardHtml(o.new_q), na = cleanCardHtml(o.new_a);
                         if (norm(nq) !== norm(c.q) || norm(na) !== norm(c.a)) this.fixes.push({ c: { ...c, q: c.q, a: c.a }, newQ: nq, newA: na, reason: String(o.reason ?? ""), conf, apply: false, st: "idle", msg: "" });
                     }
-                    if (this.optImages && c.noPic && o.needs_image && clamp(o.image_conf) >= 50)
-                        needPics.push({ c, idea: String(o.image_idea ?? ""), terms: (Array.isArray(o.en_terms) ? o.en_terms : []).map(String).filter(Boolean).slice(0, 3), conf: clamp(o.image_conf) });
+                    if (this.optImages && c.noPic && o.needs_image && clamp(o.image_conf) >= 30)
+                        needPics.push({ c, idea: String(o.image_idea ?? ""), terms: (Array.isArray(o.en_terms) ? o.en_terms : []).map(String).filter(Boolean).slice(0, 4), conf: clamp(o.image_conf) });
                 }
             }
             this.say(`${d.title}: review done, ${needPics.length} cards want a picture`);
@@ -265,7 +265,7 @@ For EACH card decide:
 - verdict "fix": ambiguous or misleading question, an answer that is wrong or incomplete${hasSrc ? " compared with the file" : ""}, two facts in one card, typo. Provide "new_q" and "new_a": the corrected card in the SAME language and the SAME simple HTML style (<b>, <i>, <u>, <br>, <span style="color:#rrggbb">) as the original; keep any {{c1::...}} markers exactly; never change the meaning unless it was wrong.
 - verdict "remove": too trivial, meaningless, garbled, or not worth testing.
 Give "confidence" 0-100 (how sure you are of YOUR verdict) and a one-sentence "reason" in the card's language.
-Then decide about a picture: "needs_image" is true ONLY if a picture of a specific structure, organ, diagram, drug structure, organism, clinical sign or instrument would clearly help memorise this card. It is false for definitions, lists, numbers, mechanisms, classifications and pure text facts. "image_conf" is 0-100. If true: "image_idea" = the thing to show in a few English words, "en_terms" = 2-3 English search phrases for Wikipedia / Wikimedia Commons, most specific first (proper English medical names). Otherwise leave them empty.
+Then decide about a picture: "needs_image" is true whenever a picture would help a student see or memorise what the card is about: anatomy and structures, organs, histology, pathology and gross specimens, radiology (X-ray, CT, MRI, ultrasound), ECG/EEG traces, microbiology and organisms, parasites, clinical signs and rashes, procedures, instruments, drug / molecule structures, pathways and algorithms that have a well-known diagram, graphs. When in doubt and a picture of the subject is likely to exist, say true. It is false only for pure text facts with nothing to look at (definitions, numbers, doses, lists of names, legal or ethical rules). "image_conf" is 0-100. If true: "image_idea" = the thing to show in a few English words, "en_terms" = 3-4 English search phrases for Wikipedia / Wikimedia Commons, most specific first and then broader (proper English medical names). Otherwise leave them empty.
 For "keep" cards, new_q and new_a must be empty strings.
 Return ONLY a JSON array: [{"id":1,"verdict":"keep","confidence":90,"reason":"...","new_q":"","new_a":"","needs_image":false,"image_conf":0,"image_idea":"","en_terms":[]}]
 
@@ -279,50 +279,96 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: c.q, a: c.a, has_picture: !c.no
         let found: Cand[] = [];
         for (const t of terms) {
             try {
-                const j = await this.getJson(`https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrnamespace=0&gsrlimit=4&gsrsearch=${encodeURIComponent(t)}&prop=pageimages&piprop=thumbnail&pithumbsize=600`);
+                const j = await this.getJson(`https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrnamespace=0&gsrlimit=6&gsrsearch=${encodeURIComponent(t)}&prop=pageimages&piprop=thumbnail&pithumbsize=600`);
                 for (const p of (Object.values(j?.query?.pages || {}) as any[]).sort((a, b) => (a.index ?? 0) - (b.index ?? 0)))
                     if (p.thumbnail?.source) found.push({ thumb: p.thumbnail.source, title: p.title + " (en)", src: "https://en.wikipedia.org/wiki/" + encodeURIComponent(p.title), lic: "Wikipedia" });
             } catch {}
             try {
-                const j = await this.getJson(`https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrnamespace=6&gsrlimit=6&gsrsearch=${encodeURIComponent(t)}${this.IMGQ}`);
+                const j = await this.getJson(`https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrnamespace=6&gsrlimit=10&gsrsearch=${encodeURIComponent(t)}${this.IMGQ}`);
                 for (const p of (Object.values(j?.query?.pages || {}) as any[]).sort((a, b) => (a.index ?? 0) - (b.index ?? 0))) {
                     const ii = p.imageinfo?.[0];
                     if (ii && /^image\/(jpeg|png|webp|gif)/.test(ii.mime)) found.push({ thumb: ii.thumburl || ii.url, title: String(p.title || "").replace(/^File:/, ""), src: ii.descriptionurl || "", lic: ii.extmetadata?.LicenseShortName?.value || "" });
                 }
             } catch {}
         }
-        if (found.length < 4 && terms[0]) {
+        if (found.length < 8 && terms[0]) {
             try {
-                const j = await this.getJson(`https://api.openverse.org/v1/images/?q=${encodeURIComponent(terms[0])}&page_size=6&mature=false&license_type=all-cc`);
+                const j = await this.getJson(`https://api.openverse.org/v1/images/?q=${encodeURIComponent(terms[0])}&page_size=10&mature=false&license_type=all-cc`);
                 for (const r of j.results || []) found.push({ thumb: r.thumbnail || r.url, title: r.title || "", src: r.foreign_landing_url || "", lic: String(r.license || "").toUpperCase() });
             } catch {}
         }
         const seen = new Set<string>();
         return found.filter((c) => c.thumb && !seen.has(c.thumb) && (seen.add(c.thumb), true));
     }
+    /** Keeps searching until a picture clears the picture threshold (more candidate sets, then new search words); the best weaker one goes to "needs attention". */
     private async findPicture(p: { c: PCard; idea: string; terms: string[]; conf: number }) {
-        const terms = p.terms.length ? p.terms : p.idea ? [p.idea] : [];
-        if (!terms.length) return;
-        const cands = (await this.searchCands(terms)).slice(0, 6);
-        const shots: { cand: Cand; img: { base64: string; mime: string } }[] = [];
-        for (const c of cands) { const img = await this.jpegB64(c.thumb); if (img) shots.push({ cand: c, img }); if (shots.length >= 4) break; }
-        if (!shots.length) { this.noPicture.push(`${plain(p.c.q).slice(0, 80)}  (${p.idea}: nothing found)`); return; }
-        const { data } = await this.ai(`You are a strict medical-education picture editor. Look at the ${shots.length} attached pictures (picture 0, 1, 2... in the order attached) for this flashcard.
+        const pth = this.cfg.pictureThreshold ?? this.cfg.threshold;
+        const uniq = (a: string[]) => a.filter((t, i) => t && a.indexOf(t) === i);
+        const st: { best: Img | null; why: string } = { best: null, why: "nothing found" };
+        const tried = new Set<string>();
+        const attempt = async (terms: string[], maxRounds: number): Promise<boolean> => {
+            const cands = (await this.searchCands(terms)).filter((c) => !tried.has(c.thumb)).slice(0, 6 * maxRounds);
+            for (let r = 0; r * 6 < cands.length; r++) {
+                const part = cands.slice(r * 6, r * 6 + 6); part.forEach((c) => tried.add(c.thumb));
+                const shots: { cand: Cand; img: { base64: string; mime: string } }[] = [];
+                for (const c of part) { const img = await this.jpegB64(c.thumb); if (img) shots.push({ cand: c, img }); }
+                if (!shots.length) continue;
+                const { data } = await this.ai(`You are a medical-education picture editor. Look at the ${shots.length} attached pictures (picture 0, 1, 2... in the order attached) for this flashcard.
 Card front: ${plain(p.c.q)}
 Card back: ${plain(p.c.a)}
 Thing to show: ${p.idea}
 The picture will be placed on the ${p.c.side} of the card.
 Candidate titles: ${shots.map((s, i) => `${i}: ${s.cand.title}`).join(" | ")}
-Choose the ONE picture that clearly shows the actual thing (right organ / structure / drug / organism / diagram), is sharp and uncluttered, and would help a student memorise this card. Prefer clean diagrams or labelled-free illustrations.
-Reject ALL (pick = -1) if none is correct, if they show something only sharing a word, contain watermarks or ads, are a collage, are too small or blurry, or (when the picture goes on the FRONT) would print the answer as a text label.
-"confidence" 0-100 is how sure you are the pick is right; "reason" is one sentence in the card's language.
+Choose the ONE picture that best shows the thing (right organ / structure / drug / organism / diagram / sign) and would help a student memorise this card. A good, usable picture of the right subject is enough: it does not have to be perfect. Prefer clean diagrams and illustrations, but a clear photo, histology slide, scan or ECG of the right subject is fine too.
+Reject ALL (pick = -1) ONLY if none shows the right subject, if they only share a word with it, contain watermarks or ads, are a collage, are unreadably small or blurry, or (when the picture goes on the FRONT) would print the answer as a text label.
+"confidence" scale: 90-100 = unmistakably the right subject, clear and usable; 80-89 = right subject, small flaws; 60-79 = probably right but unsure; below 60 = doubtful. Judge the SUBJECT and usefulness, not artistic quality.
+"reason" is one sentence in the card's language.
 Return ONLY JSON: {"pick": 0, "confidence": 90, "reason": "..."}`,
-            { type: "OBJECT", properties: { pick: { type: "INTEGER" }, confidence: { type: "NUMBER" }, reason: { type: "STRING" } }, required: ["pick", "confidence", "reason"] },
-            { files: shots.map((s) => s.img), pics: true, maxTokens: 600 });
-        const pick = Number(data?.pick);
-        if (!Number.isInteger(pick) || pick < 0 || pick >= shots.length) { this.noPicture.push(`${plain(p.c.q).slice(0, 80)}  (${p.idea}: ${String(data?.reason ?? "no picture fits")})`); return; }
-        const cs = shots.map((s) => s.cand);
-        this.imgs.push({ c: p.c, idea: p.idea, cands: cs, pick, reason: String(data?.reason ?? ""), conf: Math.min(clamp(data?.confidence), p.conf), apply: false, bg: this.optBg, st: "idle", msg: "", preview: cs[pick].thumb });
+                    { type: "OBJECT", properties: { pick: { type: "INTEGER" }, confidence: { type: "NUMBER" }, reason: { type: "STRING" } }, required: ["pick", "confidence", "reason"] },
+                    { files: shots.map((x) => x.img), pics: true, maxTokens: 600 });
+                const pick = Number(data?.pick);
+                if (!Number.isInteger(pick) || pick < 0 || pick >= shots.length) { st.why = String(data?.reason ?? "no picture fits"); continue; }
+                // second, independent look: a fresh call sees ONLY the chosen picture and must confirm it. Both must agree.
+                const { data: v } = await this.ai(`You are a medical-education fact checker. One picture is attached. A colleague wants to put it on this flashcard.
+Card front: ${plain(p.c.q)}
+Card back: ${plain(p.c.a)}
+Intended subject: ${p.idea}
+Look at the picture on its own and answer honestly:
+- "shows_subject": true only if the picture really shows the intended subject (right organ / structure / organism / sign / diagram), not just something with a similar name or a different species, organ, side or condition.
+- "junk": true if it has a watermark, advert, collage, heavy text labels that would give the answer away, or is unreadably small or blurry.
+- "confidence" scale: 90-100 = unmistakably the right subject and useful for this card; 80-89 = right subject, small flaws; 60-79 = probably right but unsure; below 60 = doubtful or wrong.
+- "reason": one sentence in the card's language.
+Return ONLY JSON: {"shows_subject": true, "junk": false, "confidence": 90, "reason": "..."}`,
+                    { type: "OBJECT", properties: { shows_subject: { type: "BOOLEAN" }, junk: { type: "BOOLEAN" }, confidence: { type: "NUMBER" }, reason: { type: "STRING" } }, required: ["shows_subject", "junk", "confidence", "reason"] },
+                    { files: [shots[pick].img], pics: true, maxTokens: 400 });
+                if (!v?.shows_subject || v?.junk) { st.why = "second check rejected it: " + String(v?.reason ?? "wrong subject"); continue; }
+                const cs = shots.map((x) => x.cand);
+                // confidence = the LOWER of the two independent opinions
+                const m: Img = { c: p.c, idea: p.idea, cands: cs, pick, reason: String(data?.reason ?? ""), conf: Math.min(clamp(data?.confidence), clamp(v?.confidence)), apply: false, bg: this.optBg, st: "idle", msg: "", preview: cs[pick].thumb };
+                if (m.conf >= pth) { this.imgs.push(m); return true; }
+                if (!st.best || m.conf > st.best.conf) st.best = m;
+                st.why = `best match so far only ${m.conf}% sure`;
+            }
+            return false;
+        };
+        const t1 = uniq([...p.terms, p.idea]).slice(0, 4);
+        if (!t1.length) return;
+        if (await attempt(t1, 4)) return;
+        // nothing good enough yet: ask for different search words and try again
+        let alt: string[] = [];
+        try {
+            const { data } = await this.ai(`A medical flashcard needs a picture of: "${p.idea}".
+Card front: ${plain(p.c.q)}
+Card back: ${plain(p.c.a)}
+These English search phrases found nothing good on Wikipedia / Wikimedia Commons: ${t1.join(" | ")}.
+Give 4 DIFFERENT English search phrases: synonyms, the Latin / alternative name, a broader or narrower term, or the type of image (e.g. "histology", "diagram", "radiograph", "ECG").
+Return ONLY JSON: {"terms": ["..."]}`,
+                { type: "OBJECT", properties: { terms: { type: "ARRAY", items: { type: "STRING" } } }, required: ["terms"] }, { maxTokens: 300 });
+            alt = uniq((Array.isArray(data?.terms) ? data.terms : []).map(String)).filter((t) => !t1.includes(t)).slice(0, 4);
+        } catch (e: any) { if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e; }
+        if (alt.length && await attempt(alt, 3)) return;
+        if (st.best) { this.imgs.push(st.best); return; } // below the threshold: reported for your attention, not applied
+        this.noPicture.push(`${plain(p.c.q).slice(0, 80)}  (${p.idea}: ${st.why})`);
     }
 
 
@@ -434,7 +480,7 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
         this.fixes = []; this.dups = []; this.rems = []; this.imgs = []; this.noPicture = [];
         l.rep = { fixes: [], deleted: [], pictures: [], noPicture: [], lowConf: [] };
         await this.analyzeDeck({ id: l.deckId!, title: l.name }, src);
-        const th = this.cfg.threshold, dth = this.cfg.deleteThreshold, rep = l.rep;
+        const th = this.cfg.threshold, dth = this.cfg.deleteThreshold, pth = this.cfg.pictureThreshold ?? th, rep = l.rep;
         const brief = (c: PCard) => ({ id: c.id, q: plain(c.q), a: plain(c.a) });
         // deletions (stricter threshold). A card that is the "keeper" of another deletion is never deleted.
         const delIds = new Set<number>([...this.dups.filter((x) => x.conf >= dth).map((x) => x.c.id), ...this.rems.filter((x) => x.conf >= dth).map((x) => x.c.id)]);
@@ -458,11 +504,11 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
             rep.lowConf.push({ kind: "keeper" in x ? "possible duplicate" : "possible removal", ...brief(x.c), reason: x.reason, conf: x.conf });
         for (const m of this.imgs) {
             if (delIds.has(m.c.id)) continue;
-            if (m.conf < th) { rep.lowConf.push({ kind: "picture", ...brief(m.c), reason: `${m.idea}: ${m.reason}`, conf: m.conf, preview: m.preview }); continue; }
+            if (m.conf < pth) { rep.lowConf.push({ kind: "picture", ...brief(m.c), reason: `${m.idea}: ${m.reason}`, conf: m.conf, preview: m.preview }); continue; }
             try {
                 await this.doImage(m);
                 const cd = m.cands[m.pick];
-                rep.pictures.push({ ...brief(m.c), idea: m.idea, title: cd.title, src: cd.src, lic: cd.lic, conf: m.conf });
+                rep.pictures.push({ ...brief(m.c), idea: m.idea, title: cd.title, src: cd.src, lic: cd.lic, conf: m.conf, thumb: cd.thumb });
             } catch (e: any) { rep.lowConf.push({ kind: "picture failed", ...brief(m.c), reason: String(e?.message || e), conf: m.conf }); }
         }
         rep.noPicture = this.noPicture.slice(0, 200);
