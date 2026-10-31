@@ -29,7 +29,7 @@ const CATALOG_CACHE_MS = 60_000;
 
 /** Unwraps a validation result or throws HTTP 400 with every problem listed. */
 function must<T>(r: Result<T>): T {
-    if (!r.ok) {
+    if (r.ok === false) {
         GenerateBadRequestException(r.errors);
         throw new Error("unreachable");
     }
@@ -498,7 +498,7 @@ export class McqService {
         const subjects = new Map<string, SubjectValue>();
         for (const raw of rawS) {
             const r = validateSubject(raw, { requireId: true });
-            if (!r.ok) {
+            if (r.ok === false) {
                 issues.push({ kind: "subject", id: idOf(raw), message: r.errors.join("; ") });
             } else if (subjects.has(r.value.id!)) {
                 issues.push({ kind: "subject", id: r.value.id!, message: "duplicate id in file (first one kept)" });
@@ -512,7 +512,7 @@ export class McqService {
         const parsedC: CollectionValue[] = [];
         for (const raw of rawC) {
             const r = validateCollection(raw, { requireId: true });
-            if (!r.ok) {
+            if (r.ok === false) {
                 issues.push({ kind: "collection", id: idOf(raw), message: r.errors.join("; ") });
             } else if (collections.has(r.value.id!)) {
                 issues.push({ kind: "collection", id: r.value.id!, message: "duplicate id in file (first one kept)" });
@@ -554,7 +554,7 @@ export class McqService {
         const questions = new Map<string, QuestionValue & { subject_id: string }>();
         for (const raw of rawQ) {
             const r = validateQuestion(raw, { requireId: true });
-            if (!r.ok) {
+            if (r.ok === false) {
                 issues.push({ kind: "question", id: idOf(raw), message: r.errors.join("; ") });
                 continue;
             }
