@@ -1,0 +1,26 @@
+{
+  "subjects": [
+    { "id": "general-surgery", "name": "الجراحة العامة", "name_en": "General Surgery" }
+  ],
+  "collections": [
+    { "id": "gs-liver-intro", "subject_id": "general-surgery", "title": "مقدمة تشريحية في الكبد وآفاته" }
+  ],
+  "questions": [
+    {
+      "id": "gs-liver-2023-q1",
+      "collection_id": "gs-liver-intro",
+      "exam_label": "دورة 2023",
+      "source": "General Surgery - Dr. Mohammad Al-Ahmad courses (EX09), p.2",
+      "text": "في كيسات الكبد البسيطة كل مما يلي صح ما عدا: (مكرر)",
+      "options": [
+        { "id": "a", "text": "من أشيع آفات الكبد السليمة." },
+        { "id": "b", "text": "لها جدار رقيق عديم التنبتات." },
+        { "id": "c", "text": "تفرز ظهارة الكيسة سائلاً رائقاً لا يحتوي على صفراء." },
+        { "id": "d", "text": "معدل النكس بعد البزل البسيط عبر الجلد منخفض للغاية." },
+        { "id": "e", "text": "لا تتصل مع الأقنية الصفراوية في الحالات النموذجية." }
+      ],
+      "correct": ["d"],
+      "explanation": "معدل النكس بعد البزل البسيط مرتفع."
+    }
+  ]
+}
