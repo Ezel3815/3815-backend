@@ -28,6 +28,9 @@ import { ServeStaticModule } from "@nestjs/serve-static";
 import { join } from "path";
 import { MosaicController } from "./controllers/mosaic.controller";
 import { MosaicService } from "./mosaic/mosaic.service";
+import { McqController } from "./controllers/mcq.controller";
+import { McqAdminController } from "./controllers/mcq-admin.controller";
+import { McqService } from "./mcq/mcq.service";
 import { NotificationsController } from "./controllers/notifications.controller";
 import { BackupController } from "./controllers/backup.controller";
 import { BackupService } from "./services/backup.service";
@@ -60,6 +63,8 @@ import { NotificationsService } from "./services/notifications.service";
         MediaController,
         ImageRestoreController,
         MosaicController,
+        McqController,
+        McqAdminController,
         NotificationsController,
         BackupController,
         PipelineController,
@@ -75,6 +80,7 @@ import { NotificationsService } from "./services/notifications.service";
         DecksCardsService,
         MediaService,
         MosaicService,
+        McqService,
         NotificationsService,
         PipelineService,
         AiService,
