@@ -447,6 +447,19 @@ export class McqService {
         };
     }
 
+    /** Publishes (or hides) every question of the given collections, except the ids in `exceptIds` (questions that still need an admin check). */
+    async publishImported(collectionIds: string[], exceptIds: string[] = [], published = true) {
+        if (!collectionIds.length) return { questions: 0 };
+        const q = await this.prisma.mcqQuestion.updateMany({
+            where: { collection_id: { in: collectionIds }, ...(exceptIds.length ? { id: { notIn: exceptIds } } : {}) },
+            data: { published },
+        });
+        if (published) await this.prisma.mcqCollection.updateMany({ where: { id: { in: collectionIds } }, data: { published: true } });
+        this.invalidate();
+        return { questions: q.count };
+    }
+
+
     /**
      * Idempotent bulk import (re-running the same file changes nothing).
      * Records are upserted by id. Invalid records are NEVER dropped silently:
