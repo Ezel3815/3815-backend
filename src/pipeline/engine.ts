@@ -14,6 +14,7 @@ export interface Lecture {
     status: string; msg: string; progress: string; stage: "queued" | "written" | "done";
     drafts: Draft[]; saved: { q: string; a: string }[]; rejected: string[];
     deckId: number | null; extracted: boolean; rep: LRep;
+    checked?: number; // polish jobs: how many cards of this deck were looked at
 }
 export interface Doctor { id: string; name: string; deckId: number | null; lectures: Lecture[]; styleText?: string; styleFile?: boolean; styleGuide?: string }
 interface Missed { location: string; topic: string; detail: string }
@@ -21,6 +22,10 @@ export interface Cfg {
     subject: string; yearId: number; instructions: string; cardCount: number | null; passes: number;
     colorize: boolean; mainColor: string; hiColor: string; hideNew: boolean;
     threshold: number; deleteThreshold: number; pictureThreshold?: number; polishWithFile: boolean; cutout: boolean;
+    // Polish-only jobs (existing decks): which checks to run, and how many cards get a picture
+    optQuality?: boolean; optDups?: boolean; optImages?: boolean;
+    /** smart = only what the reviewer flags; generous = also a second pass over every card without a picture; all = try a picture for every card without one */
+    pictureMode?: "smart" | "generous" | "all";
 }
 export interface IO {
     log(m: string): void; persist(): void;
@@ -59,7 +64,14 @@ export class Engine {
     constructor(public pool: KeyPool, public cfg: Cfg, public io: IO) {
         this.subject = cfg.subject; this.instructions = cfg.instructions || ""; this.cardCount = cfg.cardCount; this.passes = cfg.passes;
         this.colorize = cfg.colorize; this.mainColor = cfg.mainColor; this.hiColor = cfg.hiColor; this.optBg = cfg.cutout;
+        if (cfg.optQuality != null) this.optQuality = !!cfg.optQuality;
+        if (cfg.optDups != null) this.optDups = !!cfg.optDups;
+        if (cfg.optImages != null) this.optImages = !!cfg.optImages;
     }
+    lastChecked = 0;
+    private get picMode() { return this.cfg.pictureMode ?? "smart"; }
+    /** The reviewer's own "needs a picture" answers must reach this confidence to count. */
+    private get minImgConf() { return this.picMode === "all" ? 0 : this.picMode === "generous" ? 15 : 30; }
     private say(m: string) { this.io.log(m); }
     private persist() { this.io.persist(); }
     private chk() { if (this.pool.stopped) throw new PoolStopped("Paused"); }
@@ -176,6 +188,7 @@ Return ONLY a JSON array: [ { "question": "...", "answer": "..." } ]`,
     private async analyzeDeck(d: { id: number; title: string }, src: { base64: string; mime: string } | null) {
         const { cards, skipped } = await this.loadCards(d.id, d.title);
         this.say(`${d.title}: ${cards.length} cards${skipped ? ` (${skipped} special cards skipped)` : ""}`);
+        this.lastChecked = cards.length;
         if (!cards.length) return;
         const byId = new Map(cards.map((c) => [c.id, c]));
         const gone = new Set<number>(); // cards already marked for deletion
@@ -238,11 +251,36 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
                         const nq = cleanCardHtml(o.new_q), na = cleanCardHtml(o.new_a);
                         if (norm(nq) !== norm(c.q) || norm(na) !== norm(c.a)) this.fixes.push({ c: { ...c, q: c.q, a: c.a }, newQ: nq, newA: na, reason: String(o.reason ?? ""), conf, apply: false, st: "idle", msg: "" });
                     }
-                    if (this.optImages && c.noPic && o.needs_image && clamp(o.image_conf) >= 30)
+                    if (this.optImages && c.noPic && o.needs_image && clamp(o.image_conf) >= this.minImgConf)
                         needPics.push({ c, idea: String(o.image_idea ?? ""), terms: (Array.isArray(o.en_terms) ? o.en_terms : []).map(String).filter(Boolean).slice(0, 4), conf: clamp(o.image_conf) });
                 }
             }
             this.say(`${d.title}: review done, ${needPics.length} cards want a picture`);
+        }
+
+        // 2b) the reviewer judges text AND pictures in one go and says "no picture" for most cards.
+        // In "generous" / "all" mode, every card that still has no picture and was not picked yet gets a second, picture-only look.
+        if (this.optImages && this.picMode !== "smart") {
+            const have = new Set(needPics.map((p) => p.c.id));
+            const rest = cards.filter((c) => !gone.has(c.id) && c.noPic && !have.has(c.id));
+            for (let s = 0; s < rest.length; s += 30) {
+                this.chk();
+                this.progress = `${d.title}: choosing pictures ${s + 1}-${Math.min(s + 30, rest.length)} of ${rest.length}`;
+                const part = rest.slice(s, s + 30);
+                const { data } = await this.ai(this.pictureSelectPrompt(d.title, part), {
+                    type: "ARRAY", items: { type: "OBJECT", properties: {
+                        id: { type: "INTEGER" }, needs_image: { type: "BOOLEAN" }, image_conf: { type: "NUMBER" }, image_idea: { type: "STRING" }, en_terms: { type: "ARRAY", items: { type: "STRING" } },
+                    }, required: ["id", "needs_image", "image_conf", "image_idea", "en_terms"] },
+                }, { maxTokens: 8192 });
+                for (const o of Array.isArray(data) ? data : []) {
+                    const c = byId.get(o?.id); if (!c || gone.has(c.id) || have.has(c.id) || !o.needs_image || clamp(o.image_conf) < this.minImgConf) continue;
+                    const terms = (Array.isArray(o.en_terms) ? o.en_terms : []).map(String).filter(Boolean).slice(0, 4);
+                    if (!terms.length && !String(o.image_idea ?? "").trim()) continue;
+                    have.add(c.id);
+                    needPics.push({ c, idea: String(o.image_idea ?? ""), terms, conf: clamp(o.image_conf) });
+                }
+            }
+            this.say(`${d.title}: picture selection (${this.picMode}) -> ${needPics.length} cards want a picture`);
         }
 
         // 3) pictures: search, then a vision model LOOKS at the candidates and picks (or rejects all)
@@ -271,6 +309,20 @@ Return ONLY a JSON array: [{"id":1,"verdict":"keep","confidence":90,"reason":"..
 
 Cards (HTML):
 ${JSON.stringify(part.map((c) => ({ id: c.id, q: c.q, a: c.a, has_picture: !c.noPic })))}`;
+    }
+
+    private pictureSelectPrompt(title: string, part: PCard[]) {
+        const all = this.picMode === "all";
+        return `You are choosing which flashcards of the lecture "${title}" should get a PICTURE. None of these cards has a picture yet. Do not judge the text of the cards, only decide about pictures.
+${all
+    ? `Be as generous as possible: set "needs_image" to true for EVERY card unless nothing at all could be shown for it. For a card about a function, cause, symptom, treatment or a list, choose the closest thing that CAN be shown (the organ, structure, cell, organism, instrument, drug structure, diagram, scan, or a clinical photo of the condition).`
+    : `Be generous: set "needs_image" to true whenever a student would learn better with a picture and a picture of the subject probably exists on Wikipedia / Wikimedia Commons: anatomy and structures, organs, cells and tissues, histology, pathology and gross specimens, radiology (X-ray, CT, MRI, ultrasound), ECG/EEG traces, microbiology and organisms, parasites, clinical signs and rashes, procedures, instruments, drug / molecule structures, pathways, algorithms and graphs, and also cards about the function, cause or treatment of something that can be seen. Set it to false only for pure text facts with nothing to look at (definitions, numbers, doses, names of people, legal or ethical rules).`}
+"image_conf" is 0-100: how useful a picture would be. "image_idea" = the thing to show in a few English words. "en_terms" = 3-4 English search phrases for Wikipedia / Wikimedia Commons, most specific first, then broader (proper English medical names).
+If "needs_image" is false, leave image_idea and en_terms empty.
+Return ONLY a JSON array: [{"id":1,"needs_image":true,"image_conf":70,"image_idea":"...","en_terms":["..."]}] with one entry per card.
+
+Cards (HTML):
+${JSON.stringify(part.map((c) => ({ id: c.id, q: c.q, a: c.a })))}`;
     }
 
     private async getJson(url: string) { const r = await fetch(url, { headers: { "User-Agent": UA } }); if (!r.ok) throw new Error(String(r.status)); return r.json(); }
@@ -474,6 +526,14 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
             await this.polish(l, this.cfg.polishWithFile ? src : null);
             l.stage = "done"; l.status = "done"; this.persist();
         }
+    }
+
+    /** Polish-only job: review / fix / duplicates / pictures for a deck that already exists. Resumable: l.stage says if it is done. */
+    async polishExisting(l: Lecture, src: { base64: string } & { mime: string } | null) {
+        l.status = "polishing"; l.msg = "";
+        await this.polish(l, src);
+        l.checked = this.lastChecked;
+        l.stage = "done"; l.status = "done"; l.progress = ""; this.persist();
     }
 
     private async polish(l: Lecture, src: { base64: string; mime: string } | null) {
