@@ -20,6 +20,7 @@ export class PipelineController {
     @DRole() @Get("jobs/:id") detail(@Param("id", ParseIntPipe) id: number) { return this.s.detail(id); }
     @DRole() @Post("mcq-jobs") createMcq(@DUser() user: User, @Body() body: any) { return this.s.createMcq(user, body); }
     @DRole() @Post("jobs/:id/mcq-publish") mcqPublish(@Param("id", ParseIntPipe) id: number) { return this.s.mcqPublish(id); }
+    @DRole() @Post("polish-jobs") createPolish(@DUser() user: User, @Body() body: any) { return this.s.createPolish(user, body); }
     @DRole() @Post("jobs") create(@DUser() user: User, @Body() body: any) { return this.s.create(user, body); }
 
     @DRole()
