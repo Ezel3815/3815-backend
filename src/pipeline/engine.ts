@@ -56,6 +56,7 @@ export class Engine {
     readonly GEMINI = "gemini-3.5-flash";
     readonly JUDGE = "gemini-3.8-flash";
     readonly CLAUDE = "claude-sonnet-5-5";
+    readonly LITE = "gemini-3.5-flash-lite"; // fast model for the simple yes/no "which cards want a picture" pass
     private readonly BATCH = 25;
     subject: string; instructions: string; cardCount: number | null; passes: number;
     colorize: boolean; mainColor: string; hiColor: string;
@@ -69,6 +70,12 @@ export class Engine {
         if (cfg.optImages != null) this.optImages = !!cfg.optImages;
     }
     lastChecked = 0;
+    /** How many AI jobs run side by side: one per working key (max 4), so keys are not hammered. */
+    private conc() { return Math.max(1, Math.min(4, this.pool.keys.filter((k) => !k.dead).length)); }
+    private async pmap<T>(items: T[], n: number, fn: (x: T) => Promise<void>) {
+        let i = 0;
+        await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) { this.chk(); await fn(items[i++]); } }));
+    }
     private get picMode() { return this.cfg.pictureMode ?? "smart"; }
     /** The reviewer's own "needs a picture" answers must reach this confidence to count. */
     private get minImgConf() { return this.picMode === "all" ? 0 : this.picMode === "generous" ? 15 : 30; }
@@ -232,8 +239,8 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
         const needPics: { c: PCard; idea: string; terms: string[]; conf: number }[] = [];
         if (this.optQuality || this.optImages) {
             const live = cards.filter((c) => !gone.has(c.id));
-            for (let s = 0; s < live.length; s += 20) {
-                this.chk();
+            const starts: number[] = []; for (let s = 0; s < live.length; s += 20) starts.push(s);
+            await this.pmap(starts, this.conc(), async (s) => {
                 this.progress = `${d.title}: reviewing cards ${s + 1}-${Math.min(s + 20, live.length)} of ${live.length}`;
                 const part = live.slice(s, s + 20);
                 const { data } = await this.ai(this.reviewPrompt(d.title, part, !!src), {
@@ -254,7 +261,7 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
                     if (this.optImages && c.noPic && o.needs_image && clamp(o.image_conf) >= this.minImgConf)
                         needPics.push({ c, idea: String(o.image_idea ?? ""), terms: (Array.isArray(o.en_terms) ? o.en_terms : []).map(String).filter(Boolean).slice(0, 4), conf: clamp(o.image_conf) });
                 }
-            }
+            });
             this.say(`${d.title}: review done, ${needPics.length} cards want a picture`);
         }
 
@@ -263,15 +270,15 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
         if (this.optImages && this.picMode !== "smart") {
             const have = new Set(needPics.map((p) => p.c.id));
             const rest = cards.filter((c) => !gone.has(c.id) && c.noPic && !have.has(c.id));
-            for (let s = 0; s < rest.length; s += 30) {
-                this.chk();
+            const starts: number[] = []; for (let s = 0; s < rest.length; s += 30) starts.push(s);
+            await this.pmap(starts, this.conc(), async (s) => {
                 this.progress = `${d.title}: choosing pictures ${s + 1}-${Math.min(s + 30, rest.length)} of ${rest.length}`;
                 const part = rest.slice(s, s + 30);
                 const { data } = await this.ai(this.pictureSelectPrompt(d.title, part), {
                     type: "ARRAY", items: { type: "OBJECT", properties: {
                         id: { type: "INTEGER" }, needs_image: { type: "BOOLEAN" }, image_conf: { type: "NUMBER" }, image_idea: { type: "STRING" }, en_terms: { type: "ARRAY", items: { type: "STRING" } },
                     }, required: ["id", "needs_image", "image_conf", "image_idea", "en_terms"] },
-                }, { maxTokens: 8192 });
+                }, { maxTokens: 8192, lite: true });
                 for (const o of Array.isArray(data) ? data : []) {
                     const c = byId.get(o?.id); if (!c || gone.has(c.id) || have.has(c.id) || !o.needs_image || clamp(o.image_conf) < this.minImgConf) continue;
                     const terms = (Array.isArray(o.en_terms) ? o.en_terms : []).map(String).filter(Boolean).slice(0, 4);
@@ -279,17 +286,16 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
                     have.add(c.id);
                     needPics.push({ c, idea: String(o.image_idea ?? ""), terms, conf: clamp(o.image_conf) });
                 }
-            }
+            });
             this.say(`${d.title}: picture selection (${this.picMode}) -> ${needPics.length} cards want a picture`);
         }
 
         // 3) pictures: search, then a vision model LOOKS at the candidates and picks (or rejects all)
         let n = 0;
-        for (const p of needPics) {
-            this.chk(); n++;
-            this.progress = `${d.title}: pictures ${n}/${needPics.length}`;
+        await this.pmap(needPics, this.conc(), async (p) => {
+            this.progress = `${d.title}: pictures ${++n}/${needPics.length}`;
             try { await this.findPicture(p); } catch (e: any) { if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e; this.say(`Picture search failed for card ${p.c.id}: ${String(e?.message || e)}`); }
-        }
+        });
     }
 
     private reviewPrompt(title: string, part: PCard[], hasSrc: boolean) {
@@ -328,8 +334,8 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: c.q, a: c.a })))}`;
     private async getJson(url: string) { const r = await fetch(url, { headers: { "User-Agent": UA } }); if (!r.ok) throw new Error(String(r.status)); return r.json(); }
     private readonly IMGQ = "&prop=imageinfo&iiprop=url|mime|extmetadata&iiurlwidth=600&iiextmetadatafilter=LicenseShortName";
     private async searchCands(terms: string[]): Promise<Cand[]> {
-        let found: Cand[] = [];
-        for (const t of terms) {
+        const perTerm = await Promise.all(terms.map(async (t) => {
+            const found: Cand[] = [];
             try {
                 const j = await this.getJson(`https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrnamespace=0&gsrlimit=6&gsrsearch=${encodeURIComponent(t)}&prop=pageimages&piprop=thumbnail&pithumbsize=600`);
                 for (const p of (Object.values(j?.query?.pages || {}) as any[]).sort((a, b) => (a.index ?? 0) - (b.index ?? 0)))
@@ -342,7 +348,9 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: c.q, a: c.a })))}`;
                     if (ii && /^image\/(jpeg|png|webp|gif)/.test(ii.mime)) found.push({ thumb: ii.thumburl || ii.url, title: String(p.title || "").replace(/^File:/, ""), src: ii.descriptionurl || "", lic: ii.extmetadata?.LicenseShortName?.value || "" });
                 }
             } catch {}
-        }
+            return found;
+        }));
+        const found: Cand[] = perTerm.flat();
         if (found.length < 8 && terms[0]) {
             try {
                 const j = await this.getJson(`https://api.openverse.org/v1/images/?q=${encodeURIComponent(terms[0])}&page_size=10&mature=false&license_type=all-cc`);
@@ -362,8 +370,8 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: c.q, a: c.a })))}`;
             const cands = (await this.searchCands(terms)).filter((c) => !tried.has(c.thumb)).slice(0, 6 * maxRounds);
             for (let r = 0; r * 6 < cands.length; r++) {
                 const part = cands.slice(r * 6, r * 6 + 6); part.forEach((c) => tried.add(c.thumb));
-                const shots: { cand: Cand; img: { base64: string; mime: string } }[] = [];
-                for (const c of part) { const img = await this.jpegB64(c.thumb); if (img) shots.push({ cand: c, img }); }
+                const got = await Promise.all(part.map(async (c) => ({ cand: c, img: await this.jpegB64(c.thumb) })));
+                const shots = got.filter((x): x is { cand: Cand; img: { base64: string; mime: string } } => !!x.img);
                 if (!shots.length) continue;
                 const { data } = await this.ai(`You are a medical-education picture editor. Look at the ${shots.length} attached pictures (picture 0, 1, 2... in the order attached) for this flashcard.
 Card front: ${plain(p.c.q)}
@@ -381,7 +389,7 @@ Return ONLY JSON: {"pick": 0, "confidence": 90, "reason": "..."}`,
                 const pick = Number(data?.pick);
                 if (!Number.isInteger(pick) || pick < 0 || pick >= shots.length) { st.why = String(data?.reason ?? "no picture fits"); continue; }
                 // second, independent look: a fresh call sees ONLY the chosen picture and must confirm it. Both must agree.
-                const { data: v } = await this.ai(`You are a medical-education fact checker. One picture is attached. A colleague wants to put it on this flashcard.
+                const v: any = clamp(data?.confidence) >= 95 ? { shows_subject: true, junk: false, confidence: 100, reason: "" } : (await this.ai(`You are a medical-education fact checker. One picture is attached. A colleague wants to put it on this flashcard.
 Card front: ${plain(p.c.q)}
 Card back: ${plain(p.c.a)}
 Intended subject: ${p.idea}
@@ -392,7 +400,7 @@ Look at the picture on its own and answer honestly:
 - "reason": one sentence in the card's language.
 Return ONLY JSON: {"shows_subject": true, "junk": false, "confidence": 90, "reason": "..."}`,
                     { type: "OBJECT", properties: { shows_subject: { type: "BOOLEAN" }, junk: { type: "BOOLEAN" }, confidence: { type: "NUMBER" }, reason: { type: "STRING" } }, required: ["shows_subject", "junk", "confidence", "reason"] },
-                    { files: [shots[pick].img], pics: true, maxTokens: 400 });
+                    { files: [shots[pick].img], pics: true, maxTokens: 400 })).data;
                 if (!v?.shows_subject || v?.junk) { st.why = "second check rejected it: " + String(v?.reason ?? "wrong subject"); continue; }
                 const cs = shots.map((x) => x.cand);
                 // confidence = the LOWER of the two independent opinions
@@ -405,7 +413,7 @@ Return ONLY JSON: {"shows_subject": true, "junk": false, "confidence": 90, "reas
         };
         const t1 = uniq([...p.terms, p.idea]).slice(0, 4);
         if (!t1.length) return;
-        if (await attempt(t1, 4)) return;
+        if (await attempt(t1, 3)) return;
         // nothing good enough yet: ask for different search words and try again
         let alt: string[] = [];
         try {
@@ -418,7 +426,7 @@ Return ONLY JSON: {"terms": ["..."]}`,
                 { type: "OBJECT", properties: { terms: { type: "ARRAY", items: { type: "STRING" } } }, required: ["terms"] }, { maxTokens: 300 });
             alt = uniq((Array.isArray(data?.terms) ? data.terms : []).map(String)).filter((t) => !t1.includes(t)).slice(0, 4);
         } catch (e: any) { if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e; }
-        if (alt.length && await attempt(alt, 3)) return;
+        if (alt.length && await attempt(alt, 2)) return;
         if (st.best) { this.imgs.push(st.best); return; } // below the threshold: reported for your attention, not applied
         this.noPicture.push(`${plain(p.c.q).slice(0, 80)}  (${p.idea}: ${st.why})`);
     }
@@ -446,12 +454,12 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
         return String((data as any)?.guide || "").slice(0, 3500);
     }
     // judge: best model first (Claude keys), `pics` = the step looks at pictures
-    private ai(prompt: string, schema: any, o: { file?: any; files?: any[]; pics?: boolean; maxTokens?: number } = {}) {
+    private ai(prompt: string, schema: any, o: { file?: any; files?: any[]; pics?: boolean; maxTokens?: number; lite?: boolean } = {}) {
         return this.pool.run((key) => geminiJson({
-            apiKey: key, model: isClaudeKey(key) ? this.CLAUDE : this.JUDGE, prompt, schema, file: o.file, files: o.files, fast: true, maxTokens: o.maxTokens,
+            apiKey: key, model: isClaudeKey(key) ? this.CLAUDE : o.lite ? this.LITE : this.JUDGE, prompt, schema, file: o.file, files: o.files, fast: true, maxTokens: o.maxTokens,
         }), 120e3, o.pics
             ? { only: canSeePictures, role: "pics", onlyMsg: "Pictures need a Gemini or Claude key. Add one." }
-            : { prefer: isClaudeKey, role: "review" });
+            : { prefer: o.lite ? undefined : isClaudeKey, role: "review" });
     }
     private async loadCards(deckId: number, deck: string): Promise<{ cards: PCard[]; skipped: number }> {
         const rows = await this.io.loadCards(deckId);
