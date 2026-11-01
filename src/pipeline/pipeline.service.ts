@@ -199,8 +199,8 @@ export class PipelineService implements OnApplicationBootstrap {
         const ls: Lecture[] = (state?.doctors ?? []).flatMap((d: Doctor) => d.lectures);
         return {
             kind, runAt,
-            lectures: ls.map((l) => ({ id: l.id, name: l.name, status: l.status, stage: l.stage, msg: l.msg, progress: l.progress, cards: l.saved.length })),
-            done: ls.filter((l) => l.stage === "done").length, total: ls.length, cards: ls.reduce((n, l) => n + l.saved.length, 0),
+            lectures: ls.map((l) => ({ id: l.id, name: l.name, status: l.status, stage: l.stage, msg: l.msg, progress: l.progress, cards: l.saved.length || l.checked || 0 })),
+            done: ls.filter((l) => l.stage === "done").length, total: ls.length, cards: ls.reduce((n, l) => n + (l.saved.length || l.checked || 0), 0),
         };
     }
 
@@ -286,22 +286,9 @@ export class PipelineService implements OnApplicationBootstrap {
         this.checkedDecks.add(deckId);
     }
 
-    private async runJob(id: number): Promise<boolean> {
-        const job = await this.get(id);
-        if ((job.state as any)?.kind === "mcq") return this.runMcqJob(job);
-        const cfg = job.config as unknown as Cfg;
-        const st: any = job.state;
-        const doctors: Doctor[] = st.doctors;
-        const user = await this.prisma.user.findUnique({ where: { id: job.user_id } });
-        if (!user) { await this.finish(id, "error", "The admin who started this job no longer exists.", st); return true; }
-        this.currentId = id; this.pool.stopped = false;
-        const log: string[] = Array.isArray(job.log) ? (job.log as string[]) : [];
-        let timer: NodeJS.Timeout | undefined;
-        const persist = () => {
-            clearTimeout(timer);
-            timer = setTimeout(() => this.prisma.pipelineJob.update({ where: { id }, data: { state: st, log: log.slice(0, 150) } }).catch(() => {}), 1500);
-        };
-        const io: IO = {
+    /** What the engine may do with the database: read / fix / delete cards and attach pictures. */
+    private makeIO(user: User, log: string[], persist: () => void): IO {
+        return {
             log: (m) => { log.unshift(`${new Date().toISOString().slice(11, 19)}  ${m}`); persist(); },
             persist,
             saveCard: async (deckId, q, a) => (await this.assertCardsDeck(deckId), await this.cards.create(user, deckId, { type: CardType.BASIC, data: { front: { text: q, size: 14, align: "center" }, back: { text: a, size: 14, align: "center" } } } as any) as any)?.id ?? 0,
@@ -320,6 +307,111 @@ export class PipelineService implements OnApplicationBootstrap {
                 await this.prisma.card.update({ where: { id: cid }, data: { back_image_name: m.name } });
             },
         };
+    }
+
+    // ---------------- Polish jobs: review / fix / duplicates / pictures for decks that ALREADY exist ----------------
+    /** body: { title?, deckIds: number[] (card decks), config?: { threshold, deleteThreshold, pictureThreshold, cutout, optQuality, optDups, optImages, pictureMode } } */
+    async createPolish(user: User, body: any) {
+        const ids: number[] = [...new Set<number>((Array.isArray(body?.deckIds) ? body.deckIds : []).map(Number).filter((x: number) => Number.isInteger(x) && x > 0))].slice(0, 500);
+        if (!ids.length) throw new BadRequestException("Choose at least one lecture deck.");
+        const decks = await this.prisma.deck.findMany({ where: { id: { in: ids } }, select: { id: true, title: true, type: true } });
+        const byId = new Map(decks.map((d) => [d.id, d]));
+        const missing = ids.filter((i) => !byId.has(i) || byId.get(i)!.type !== "CARDS_DECK");
+        if (missing.length) throw new BadRequestException(`These are not card decks (lectures): ${missing.slice(0, 10).join(", ")}.`);
+        const c = body?.config ?? {};
+        const mode = (["smart", "generous", "all"] as const).includes(c.pictureMode) ? c.pictureMode : "generous";
+        const title = String(body?.title || "").trim().slice(0, 120) || `Polish · ${ids.length} lecture${ids.length === 1 ? "" : "s"}`;
+        const config: Cfg = {
+            subject: title, yearId: 0, instructions: "", cardCount: null, passes: 0, colorize: true, mainColor: "#009688", hiColor: "#673ab7", hideNew: false,
+            threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
+            polishWithFile: true, cutout: c.cutout !== false,
+            optQuality: c.optQuality !== false, optDups: c.optDups !== false, optImages: c.optImages !== false, pictureMode: mode,
+        };
+        const lectures: Lecture[] = ids.map((id): Lecture => ({
+            id: `d${id}`, name: byId.get(id)!.title, fileName: "", size: 0, status: "queued", msg: "", progress: "", stage: "written",
+            drafts: [], saved: [], rejected: [], deckId: id, extracted: true, rep: emptyRep(),
+        }));
+        const state = { kind: "polish", subjectId: null, doctors: [{ id: "polish", name: "Polish", deckId: null, styleText: "", styleFile: false, lectures }], createdAt: Date.now() };
+        const job = await this.prisma.pipelineJob.create({ data: { title, user_id: user.id, config: config as any, state: state as any, log: [] } });
+        return { id: job.id };
+    }
+
+    private async runPolishJob(job: any): Promise<boolean> {
+        const id: number = job.id;
+        const cfg = job.config as unknown as Cfg;
+        const st: any = job.state;
+        const doctors: Doctor[] = st.doctors;
+        const lectures = doctors.flatMap((d) => d.lectures);
+        const user = await this.prisma.user.findUnique({ where: { id: job.user_id } });
+        if (!user) { await this.finish(id, "error", "The admin who started this job no longer exists.", st); return true; }
+        this.currentId = id; this.pool.stopped = false;
+        const log: string[] = Array.isArray(job.log) ? (job.log as string[]) : [];
+        let timer: NodeJS.Timeout | undefined;
+        const persist = () => {
+            clearTimeout(timer);
+            timer = setTimeout(() => this.prisma.pipelineJob.update({ where: { id }, data: { state: st, log: log.slice(0, 150) } }).catch(() => {}), 1500);
+        };
+        const io = this.makeIO(user, log, persist);
+        await this.prisma.pipelineJob.update({ where: { id }, data: { status: "running", message: null } });
+        try {
+            if (!this.pool.keys.some((k) => !k.dead)) throw new Error("No AI key on the server. Add keys in Pipeline > AI keys.");
+            const engine = new Engine(this.pool, cfg, io);
+            for (const d of doctors) for (const l of d.lectures) {
+                if (l.stage === "done" || l.deckId == null) continue;
+                if (this.pool.stopped) throw new PoolStopped("Paused");
+                try {
+                    const exists = await this.prisma.deck.findUnique({ where: { id: l.deckId }, select: { id: true } });
+                    if (!exists) { l.status = "error"; l.msg = "This deck was deleted."; continue; }
+                    const src = await this.loadFile(id, l.id); // optional lecture file: lets the reviewer check facts against it
+                    await engine.polishExisting(l, src);
+                    await this.prisma.pipelineFile.deleteMany({ where: { job_id: id, lecture_id: l.id } });
+                } catch (e: any) {
+                    if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e;
+                    l.status = "error"; l.msg = String(e?.message || e); io.log(`${l.name}: ${l.msg}`);
+                }
+                persist();
+            }
+            const failed = lectures.some((l) => l.stage !== "done");
+            clearTimeout(timer);
+            const doneMsg = failed ? "Finished with some lectures failed: see the report, then press Resume." : "Finished.";
+            const rep = this.buildReport(job.title, st, cfg);
+            await this.finish(id, "done", doneMsg, st, log, rep);
+            this.waitMailed.delete(id);
+            await this.notify(user, job.title, "done", doneMsg, rep);
+            return true;
+        } catch (e: any) {
+            clearTimeout(timer);
+            if (e instanceof PoolStopped) { await this.finish(id, "paused", "Paused.", st, log); return false; }
+            if (e instanceof PoolExhausted) {
+                const m = `${e.message} It continues by itself in about 20 minutes. Add more keys in Pipeline > AI keys to speed it up.`;
+                await this.finish(id, "waiting", m, st, log); this.scheduleRetry();
+                if (!this.waitMailed.has(id)) { this.waitMailed.add(id); await this.notify(user, job.title, "waiting", m); }
+                return false;
+            }
+            const rep = this.buildReport(job.title, st, cfg), em = String(e?.message || e);
+            await this.finish(id, "error", em, st, log, rep);
+            await this.notify(user, job.title, "error", em, rep);
+            return true;
+        } finally { clearTimeout(timer); this.pool.stopped = false; }
+    }
+
+    private async runJob(id: number): Promise<boolean> {
+        const job = await this.get(id);
+        if ((job.state as any)?.kind === "mcq") return this.runMcqJob(job);
+        if ((job.state as any)?.kind === "polish") return this.runPolishJob(job);
+        const cfg = job.config as unknown as Cfg;
+        const st: any = job.state;
+        const doctors: Doctor[] = st.doctors;
+        const user = await this.prisma.user.findUnique({ where: { id: job.user_id } });
+        if (!user) { await this.finish(id, "error", "The admin who started this job no longer exists.", st); return true; }
+        this.currentId = id; this.pool.stopped = false;
+        const log: string[] = Array.isArray(job.log) ? (job.log as string[]) : [];
+        let timer: NodeJS.Timeout | undefined;
+        const persist = () => {
+            clearTimeout(timer);
+            timer = setTimeout(() => this.prisma.pipelineJob.update({ where: { id }, data: { state: st, log: log.slice(0, 150) } }).catch(() => {}), 1500);
+        };
+        const io = this.makeIO(user, log, persist);
         await this.prisma.pipelineJob.update({ where: { id }, data: { status: "running", message: null } });
         try {
             if (!this.pool.keys.some((k) => !k.dead)) throw new Error("No AI key on the server. Add keys in Pipeline > AI keys.");
@@ -532,12 +624,12 @@ export class PipelineService implements OnApplicationBootstrap {
             title, subject: cfg.subject, finishedAt: new Date().toISOString(), startedAt: new Date(st.createdAt || Date.now()).toISOString(),
             settings: { threshold: cfg.threshold, pictureThreshold: cfg.pictureThreshold ?? cfg.threshold, deleteThreshold: cfg.deleteThreshold, passes: cfg.passes, checkedAgainstFile: cfg.polishWithFile },
             totals: {
-                lectures: ls.length, lecturesDone: ls.filter(({ l }) => l.stage === "done").length, cards: sum((l) => l.saved.length),
+                lectures: ls.length, lecturesDone: ls.filter(({ l }) => l.stage === "done").length, cards: sum((l) => l.saved.length || l.checked || 0),
                 fixed: sum((l) => l.rep?.fixes?.length ?? 0), deleted: sum((l) => l.rep?.deleted?.length ?? 0),
                 pictures: sum((l) => l.rep?.pictures?.length ?? 0), noPicture: sum((l) => l.rep?.noPicture?.length ?? 0), attention: sum((l) => l.rep?.lowConf?.length ?? 0),
             },
             styles: (st.doctors as Doctor[]).filter((d) => d.styleGuide).map((d) => ({ doctor: d.name, guide: d.styleGuide })),
-            lectures: ls.map(({ d, l }) => ({ doctor: d.name, name: l.name, status: l.stage === "done" ? "done" : l.status, error: l.stage === "done" ? "" : l.msg, cards: l.saved.length, ...l.rep })),
+            lectures: ls.map(({ d, l }) => ({ doctor: d.name, name: l.name, status: l.stage === "done" ? "done" : l.status, error: l.stage === "done" ? "" : l.msg, cards: l.saved.length || l.checked || 0, ...l.rep })),
             keys: this.keys(),
         };
     }
