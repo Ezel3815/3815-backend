@@ -36,6 +36,8 @@ import { BackupController } from "./controllers/backup.controller";
 import { BackupService } from "./services/backup.service";
 import { PipelineController } from "./pipeline/pipeline.controller";
 import { PipelineService } from "./pipeline/pipeline.service";
+import { AnalyticsController } from "./analytics/analytics.controller";
+import { AnalyticsService } from "./analytics/analytics.service";
 import { AiController } from "./ai/ai.controller";
 import { AiService } from "./ai/ai.service";
 import { QuizService } from "./ai/quiz.service";
@@ -68,6 +70,7 @@ import { NotificationsService } from "./services/notifications.service";
         NotificationsController,
         BackupController,
         PipelineController,
+        AnalyticsController,
         AiController,
     ],
     providers: [
@@ -83,6 +86,7 @@ import { NotificationsService } from "./services/notifications.service";
         McqService,
         NotificationsService,
         PipelineService,
+        AnalyticsService,
         AiService,
         QuizService,
         PaymentsService,
