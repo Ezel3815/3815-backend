@@ -110,8 +110,8 @@ Return ONLY a JSON array, no markdown fences, no commentary, in exactly this sha
         l.colId = colId;
         const textFile = src.mime === "text/plain" ? Buffer.from(src.base64, "base64").toString("utf8").slice(0, 400_000) : null;
         l.status = "reading questions"; l.msg = "";
-        const colRec = (published: boolean) => ({ id: colId, subject_id: subjectId, title: l.name, published });
-        const first = await this.io.importBank({ collections: [colRec(false)] });
+        const colRec = (published?: boolean) => ({ id: colId, subject_id: subjectId, title: l.name, ...(published === undefined ? {} : { published }) }); // no `published` = keep whatever it is now (a resumed/re-run job must not hide a collection that is already live)
+        const first = await this.io.importBank({ collections: [colRec()] });
         if (!first.applied) throw new Error(first.issues.map((i) => i.message).join("; ") || "Could not create the collection.");
 
         const seen = new Set<string>(l.saved.map((s) => s.q)); // ids already saved (resume after a stop)
@@ -152,7 +152,7 @@ Return ONLY a JSON array, no markdown fences, no commentary, in exactly this sha
             l.progress = `${l.saved.length} questions`; this.io.persist();
         }
         // the collection becomes visible in the app only when it has at least one published question
-        await this.io.importBank({ collections: [colRec(anyPublished)] });
+        if (anyPublished) await this.io.importBank({ collections: [colRec(true)] });
         this.io.log(`${l.name}: ${l.saved.length} questions saved, ${rep.lowConf.length} need your check${l.rejected.length ? `, ${l.rejected.length} could not be read` : ""}`);
         l.progress = ""; l.stage = "done"; l.status = "done"; l.extracted = true; this.io.persist();
     }
