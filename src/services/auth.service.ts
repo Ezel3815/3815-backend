@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, ServiceUnavailableException } from "@nestjs/common";
 import { JwtService } from "@nestjs/jwt";
 import { Prisma, User, UserStatus } from "@prisma/client";
 import { PrismaService } from "nestjs-prisma";
@@ -242,8 +242,16 @@ export class AuthService {
                     session_code: user.session_code,
                 }),
             };
-        } catch (e) {
-            GenerateBadRequestException(["Bad Credentials"]);
+        } catch (e: any) {
+            // Only "no user with this email + password" means wrong credentials (P2025).
+            // A database timeout / pool exhaustion must NOT look like a wrong password.
+            if (e?.code === "P2025") {
+                GenerateBadRequestException(["Bad Credentials"]);
+            }
+            console.error("[login] database error:", e?.code, e?.message);
+            throw new ServiceUnavailableException(
+                "Server is busy, please try again in a moment",
+            );
         }
     }
 
