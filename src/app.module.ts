@@ -35,6 +35,8 @@ import { NotificationsController } from "./controllers/notifications.controller"
 import { BackupController } from "./controllers/backup.controller";
 import { BackupService } from "./services/backup.service";
 import { PipelineController } from "./pipeline/pipeline.controller";
+import { Models3dController } from "./models3d/models3d.controller";
+import { Models3dService } from "./models3d/models3d.service";
 import { PipelineService } from "./pipeline/pipeline.service";
 import { AnalyticsController } from "./analytics/analytics.controller";
 import { AnalyticsService } from "./analytics/analytics.service";
@@ -63,6 +65,7 @@ import { NotificationsService } from "./services/notifications.service";
         DecksController,
         DecksCardsController,
         MediaController,
+        Models3dController,
         ImageRestoreController,
         MosaicController,
         McqController,
@@ -79,6 +82,7 @@ import { NotificationsService } from "./services/notifications.service";
         UsersService,
         EmailService,
         CodesService,
+        Models3dService,
         DecksService,
         DecksCardsService,
         MediaService,
