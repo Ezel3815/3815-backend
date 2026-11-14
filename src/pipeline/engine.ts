@@ -8,7 +8,7 @@ import { geminiJson } from "./gemini-json";
 import { KeyPool, PoolExhausted, PoolStopped, isClaudeKey, canSeePictures } from "./key-pool";
 
 export interface Draft { question: string; answer: string; status: string; msg: string }
-export interface LRep { fixes: any[]; deleted: any[]; pictures: any[]; noPicture: string[]; lowConf: any[] }
+export interface LRep { fixes: any[]; deleted: any[]; pictures: any[]; noPicture: string[]; lowConf: any[]; models?: any[] }
 export interface Lecture {
     id: string; name: string; fileName: string; size: number;
     status: string; msg: string; progress: string; stage: "queued" | "written" | "done";
@@ -26,6 +26,12 @@ export interface Cfg {
     optQuality?: boolean; optDups?: boolean; optImages?: boolean;
     /** smart = only what the reviewer flags; generous = also a second pass over every card without a picture; all = try a picture for every card without one */
     pictureMode?: "smart" | "generous" | "all";
+    /** 3D models from the dashboard library: matched to cards BEFORE any picture search (default on). */
+    use3d?: boolean;
+    /** A card that already has a picture also gets the matching 3D model (default on). */
+    replacePhotos?: boolean;
+    /** Where the model appears: with the answer (default) or with the question. */
+    modelSide?: "front" | "back";
 }
 export interface IO {
     log(m: string): void; persist(): void;
@@ -34,9 +40,11 @@ export interface IO {
     updateCard(deckId: number, id: number, type: string, data: any): Promise<void>;
     deleteCard(deckId: number, id: number): Promise<void>;
     attach(cardId: number, png: Buffer): Promise<void>;
+    loadModels(): Promise<{ id: number; name: string; aliases: string; category: string; file: string }[]>;
 }
 interface Cand { thumb: string; title: string; src: string; lic: string }
 interface PCard { id: number; deckId: number; deck: string; type: string; data: any; q: string; a: string; side: "front" | "back"; noPic: boolean }
+interface Mdl { c: PCard; modelId: number; name: string; file: string; conf: number; reason: string }
 type St = "idle" | "working" | "done" | "error";
 interface Fix { c: PCard; newQ: string; newA: string; reason: string; conf: number; apply: boolean; st: St; msg: string }
 interface Dup { c: PCard; keeper: PCard; reason: string; conf: number; apply: boolean; st: St; msg: string }
@@ -61,7 +69,7 @@ export class Engine {
     subject: string; instructions: string; cardCount: number | null; passes: number;
     colorize: boolean; mainColor: string; hiColor: string;
     optDups = true; optQuality = true; optImages = true; optBg: boolean; progress = "";
-    fixes: Fix[] = []; dups: Dup[] = []; rems: Rem[] = []; imgs: Img[] = []; noPicture: string[] = [];
+    fixes: Fix[] = []; dups: Dup[] = []; rems: Rem[] = []; imgs: Img[] = []; noPicture: string[] = []; models: Mdl[] = [];
     constructor(public pool: KeyPool, public cfg: Cfg, public io: IO) {
         this.subject = cfg.subject; this.instructions = cfg.instructions || ""; this.cardCount = cfg.cardCount; this.passes = cfg.passes;
         this.colorize = cfg.colorize; this.mainColor = cfg.mainColor; this.hiColor = cfg.hiColor; this.optBg = cfg.cutout;
@@ -265,10 +273,23 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
             this.say(`${d.title}: review done, ${needPics.length} cards want a picture`);
         }
 
+        // 2a) 3D models from the library: a matching model is used INSTEAD of searching for a picture
+        const modelled = new Set<number>();
+        if (this.cfg.use3d !== false) {
+            try {
+                for (const m of await this.pickModels(d.title, cards, gone)) {
+                    this.models.push(m);
+                    if (m.conf >= (this.cfg.pictureThreshold ?? this.cfg.threshold)) modelled.add(m.c.id);
+                }
+                for (let i = needPics.length - 1; i >= 0; i--) if (modelled.has(needPics[i].c.id)) needPics.splice(i, 1);
+                this.say(`${d.title}: ${this.models.length} cards matched a 3D model`);
+            } catch (e: any) { if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e; this.say(`3D model matching failed: ${String(e?.message || e)}`); }
+        }
+
         // 2b) the reviewer judges text AND pictures in one go and says "no picture" for most cards.
         // In "generous" / "all" mode, every card that still has no picture and was not picked yet gets a second, picture-only look.
         if (this.optImages && this.picMode !== "smart") {
-            const have = new Set(needPics.map((p) => p.c.id));
+            const have = new Set([...needPics.map((p) => p.c.id), ...modelled]);
             const rest = cards.filter((c) => !gone.has(c.id) && c.noPic && !have.has(c.id));
             const starts: number[] = []; for (let s = 0; s < rest.length; s += 30) starts.push(s);
             await this.pmap(starts, this.conc(), async (s) => {
@@ -296,6 +317,39 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
             this.progress = `${d.title}: pictures ${++n}/${needPics.length}`;
             try { await this.findPicture(p); } catch (e: any) { if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e; this.say(`Picture search failed for card ${p.c.id}: ${String(e?.message || e)}`); }
         });
+    }
+
+    /** Asks the AI which cards are about exactly one model of the library. Text only, one call per 30 cards. */
+    private async pickModels(title: string, cards: PCard[], gone: Set<number>): Promise<Mdl[]> {
+        const lib = (await this.io.loadModels()).slice(0, 800);
+        if (!lib.length) return [];
+        const byId = new Map(lib.map((m) => [m.id, m]));
+        const catalog = lib.map((m) => `${m.id}: ${m.name}${m.aliases ? " | " + m.aliases : ""}${m.category ? " [" + m.category + "]" : ""}`).join("\n");
+        const todo = cards.filter((c) => !gone.has(c.id) && !c.data?.model?.url && (c.noPic || this.cfg.replacePhotos !== false));
+        const out: Mdl[] = [];
+        for (let s = 0; s < todo.length; s += 30) {
+            const part = todo.slice(s, s + 30);
+            this.progress = `${title}: 3D models ${s + 1}-${Math.min(s + 30, todo.length)} of ${todo.length}`;
+            const { data } = await this.ai(`You match flashcards of the lecture "${title}" to a LIBRARY of ready 3D anatomy models.
+LIBRARY (id: name | other names or languages [category]):
+${catalog}
+
+For EACH card decide whether ONE library model shows exactly the structure the card is about (for example a card about the origin or action of the biceps brachii -> the "Biceps brachii" model). Pick a model only when the card's main subject IS that structure. NEVER pick a model that only belongs to the same region, organ system or a neighbouring structure. If no model fits exactly, model_id = 0.
+"confidence" 0-100: how sure you are that this model is the right one for this card. "reason": one short sentence in the card's language.
+Return ONLY a JSON array with one entry per card: [{"id":1,"model_id":12,"confidence":90,"reason":"..."}]
+
+CARDS:
+${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q), a: plain(c.a) })))}`,
+                { type: "ARRAY", items: { type: "OBJECT", properties: { id: { type: "INTEGER" }, model_id: { type: "INTEGER" }, confidence: { type: "NUMBER" }, reason: { type: "STRING" } }, required: ["id", "model_id", "confidence", "reason"] } },
+                { maxTokens: 4000 });
+            const byCard = new Map(part.map((c) => [c.id, c]));
+            for (const o of Array.isArray(data) ? data : []) {
+                const c = byCard.get(Number(o?.id)); const m = byId.get(Number(o?.model_id));
+                if (!c || !m) continue;
+                out.push({ c, modelId: m.id, name: m.name, file: m.file, conf: clamp(o?.confidence), reason: String(o?.reason ?? "") });
+            }
+        }
+        return out;
     }
 
     private reviewPrompt(title: string, part: PCard[], hasSrc: boolean) {
@@ -545,7 +599,7 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
     }
 
     private async polish(l: Lecture, src: { base64: string; mime: string } | null) {
-        this.fixes = []; this.dups = []; this.rems = []; this.imgs = []; this.noPicture = [];
+        this.fixes = []; this.dups = []; this.rems = []; this.imgs = []; this.noPicture = []; this.models = [];
         l.rep = { fixes: [], deleted: [], pictures: [], noPicture: [], lowConf: [] };
         await this.analyzeDeck({ id: l.deckId!, title: l.name }, src);
         const th = this.cfg.threshold, dth = this.cfg.deleteThreshold, pth = this.cfg.pictureThreshold ?? th, rep = l.rep;
@@ -570,6 +624,17 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
         }
         for (const x of [...this.dups.filter((d) => d.conf < dth), ...this.rems.filter((r) => r.conf < dth)])
             rep.lowConf.push({ kind: "keeper" in x ? "possible duplicate" : "possible removal", ...brief(x.c), reason: x.reason, conf: x.conf });
+        rep.models = [];
+        for (const m of this.models) {
+            if (delIds.has(m.c.id)) continue;
+            if (m.conf < pth) { rep.lowConf.push({ kind: "3D model", ...brief(m.c), reason: `${m.name}: ${m.reason}`, conf: m.conf }); continue; }
+            try {
+                const data = JSON.parse(JSON.stringify(m.c.data));
+                data.model = { side: this.cfg.modelSide === "front" ? "front" : "back", url: m.file };
+                await this.io.updateCard(m.c.deckId, m.c.id, m.c.type, data);
+                rep.models.push({ ...brief(m.c), model: m.name, conf: m.conf, reason: m.reason });
+            } catch (e: any) { rep.lowConf.push({ kind: "3D model failed", ...brief(m.c), reason: String(e?.message || e), conf: m.conf }); }
+        }
         for (const m of this.imgs) {
             if (delIds.has(m.c.id)) continue;
             if (m.conf < pth) { rep.lowConf.push({ kind: "picture", ...brief(m.c), reason: `${m.idea}: ${m.reason}`, conf: m.conf, preview: m.preview }); continue; }
@@ -580,6 +645,6 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
             } catch (e: any) { rep.lowConf.push({ kind: "picture failed", ...brief(m.c), reason: String(e?.message || e), conf: m.conf }); }
         }
         rep.noPicture = this.noPicture.slice(0, 200);
-        this.say(`${l.name}: ${rep.fixes.length} fixed, ${rep.deleted.length} deleted, ${rep.pictures.length} pictures, ${rep.lowConf.length} for your attention`);
+        this.say(`${l.name}: ${rep.fixes.length} fixed, ${rep.deleted.length} deleted, ${rep.models?.length ?? 0} 3D models, ${rep.pictures.length} pictures, ${rep.lowConf.length} for your attention`);
     }
 }
