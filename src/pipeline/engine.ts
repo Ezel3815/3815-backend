@@ -28,6 +28,8 @@ export interface Cfg {
     pictureMode?: "smart" | "generous" | "all";
     /** 3D models from the dashboard library: matched to cards BEFORE any picture search (default on). */
     use3d?: boolean;
+    /** "anatomy" (default): only decks the AI recognises as human anatomy look at the library; "all": every deck; "off": never. */
+    models3dMode?: "anatomy" | "all" | "off";
     /** A card that already has a picture also gets the matching 3D model (default on). */
     replacePhotos?: boolean;
     /** Where the model appears: with the answer (default) or with the question. */
@@ -275,7 +277,7 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
 
         // 2a) 3D models from the library: a matching model is used INSTEAD of searching for a picture
         const modelled = new Set<number>();
-        if (this.cfg.use3d !== false) {
+        if (this.cfg.use3d !== false && this.cfg.models3dMode !== "off" && await this.wants3d(d.title, cards)) {
             try {
                 for (const m of await this.pickModels(d.title, cards, gone)) {
                     this.models.push(m);
@@ -319,6 +321,34 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
         });
     }
 
+    private anatomyDecks = new Map<number, boolean>();
+    /** 3D models are only for anatomy. Decks of other subjects never look at the library (no AI call about models, no mistakes). */
+    private async wants3d(title: string, cards: PCard[]): Promise<boolean> {
+        if (this.cfg.models3dMode === "all") return true;
+        const key = cards[0]?.deckId ?? -1;
+        const known = this.anatomyDecks.get(key);
+        if (known !== undefined) return known;
+        let yes = false;
+        try {
+            if ((await this.io.loadModels()).length) {
+                const sample = cards.slice(0, 15).map((c) => "- " + plain(c.q).slice(0, 140)).join("\n");
+                const { data } = await this.ai(`Is this flashcard deck about HUMAN ANATOMY, meaning the shape, parts, position, attachments or relations of body structures (muscles, bones, joints, organs, vessels, nerves, regions)?
+Physiology, pathology, pharmacology, biochemistry, microbiology, histology slides, radiology reading, clinical medicine, surgery steps and non-medical subjects are NOT anatomy, even when they mention body parts.
+Subject: ${this.cfg.subject}
+Deck: ${title}
+Sample questions:
+${sample}
+Return ONLY JSON: {"anatomy": true, "confidence": 90}`,
+                    { type: "OBJECT", properties: { anatomy: { type: "BOOLEAN" }, confidence: { type: "NUMBER" } }, required: ["anatomy", "confidence"] },
+                    { lite: true, maxTokens: 200 });
+                yes = data?.anatomy === true && clamp(data?.confidence) >= 60;
+            }
+        } catch (e: any) { if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e; }
+        this.anatomyDecks.set(key, yes);
+        if (yes) this.say(`${title}: anatomy deck, matching 3D models`);
+        return yes;
+    }
+
     /** Asks the AI which cards are about exactly one model of the library. Text only, one call per 30 cards. */
     private async pickModels(title: string, cards: PCard[], gone: Set<number>): Promise<Mdl[]> {
         const lib = (await this.io.loadModels()).slice(0, 800);
@@ -334,7 +364,7 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
 LIBRARY (id: name | other names or languages [category]):
 ${catalog}
 
-For EACH card decide whether ONE library model shows exactly the structure the card is about (for example a card about the origin or action of the biceps brachii -> the "Biceps brachii" model). Pick a model only when the card's main subject IS that structure. NEVER pick a model that only belongs to the same region, organ system or a neighbouring structure. If no model fits exactly, model_id = 0.
+For EACH card decide whether ONE library model shows exactly the structure the card is about (for example a card about the origin or action of the biceps brachii -> the "Biceps brachii" model). This is only for the ANATOMY of a structure (what it is, where it is, its parts, attachments, relations). A card about the physiology, pathology, drugs, tests or treatment of an organ is NOT a match. Pick a model only when the card's main subject IS that structure. NEVER pick a model that only belongs to the same region, organ system or a neighbouring structure. If no model fits exactly, model_id = 0.
 "confidence" 0-100: how sure you are that this model is the right one for this card. "reason": one short sentence in the card's language.
 Return ONLY a JSON array with one entry per card: [{"id":1,"model_id":12,"confidence":90,"reason":"..."}]
 
