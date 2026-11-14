@@ -1,7 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { MediaType, User, Prisma } from "@prisma/client";
 import { PrismaService } from "nestjs-prisma";
-import { SpinFrameNames } from "src/utils/spin.utils";
+import { ModelFileNames } from "src/utils/model.utils";
 import { DocumentOutDto } from "src/dtos/decks/document.out-dto";
 import {
     DeleteFile,
@@ -62,13 +62,15 @@ export class MediaService {
                 document_card: null,
             },
         });
-        // 360° photos are referenced only from inside card.data (no FK): keep them
+        // 3D models are referenced only from inside card.data (no FK): keep the ones in use
         const used = new Set<string>();
         if (media.length) {
             const cards = await this.prismaService.$queryRaw<{ data: any }[]>`
-                SELECT data FROM Card WHERE CAST(data AS CHAR) LIKE '%spin%'`;
+                SELECT data FROM Card WHERE CAST(data AS CHAR) LIKE '%model%'`;
             for (const c of cards)
-                for (const n of SpinFrameNames(c.data)) used.add(n);
+                for (const n of ModelFileNames(c.data)) used.add(n);
+            const lib = await this.prismaService.$queryRaw<{ file_name: string }[]>`SELECT file_name FROM Model3D`;
+            for (const m of lib) used.add(m.file_name);
         }
         const orphans = media.filter((m) => !used.has(m.name));
         for (const m of orphans) {
@@ -78,6 +80,15 @@ export class MediaService {
             where: { name: { in: orphans.map((m) => m.name) } },
         });
     }
+    /** Several cards can share one 3D model file: delete it only when no other card uses it. */
+    async deleteModelIfUnused(name: string, exceptCardId: number) {
+        const like = `%${name.replace(/[\\%_]/g, "\\$&")}%`;
+        const other = await this.prismaService.$queryRaw<{ id: number }[]>`
+            SELECT id FROM Card WHERE id <> ${exceptCardId}
+            AND CAST(data AS CHAR) LIKE ${like} LIMIT 1`;
+        if (other.length === 0) await this.delete(name);
+    }
+
     async deleteForCard(cardId: number) {
         const card = await this.prismaService.card.findUnique({
             where: { id: cardId },
@@ -91,9 +102,11 @@ export class MediaService {
             [card.back_image_name, card.front_image_name, card.document_name]
                 .filter(Boolean),
         );
-        for (const n of SpinFrameNames(card.data)) names.add(n);
         for (const name of names) {
             await this.delete(name);
+        }
+        for (const name of ModelFileNames(card.data)) {
+            await this.deleteModelIfUnused(name, cardId);
         }
     }
     async readDocuments(user: User) {
