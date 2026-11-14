@@ -1,6 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { MediaType, User, Prisma } from "@prisma/client";
 import { PrismaService } from "nestjs-prisma";
+import { SpinFrameNames } from "src/utils/spin.utils";
 import { DocumentOutDto } from "src/dtos/decks/document.out-dto";
 import {
     DeleteFile,
@@ -61,11 +62,20 @@ export class MediaService {
                 document_card: null,
             },
         });
-        for (const m of media) {
+        // 360° photos are referenced only from inside card.data (no FK): keep them
+        const used = new Set<string>();
+        if (media.length) {
+            const cards = await this.prismaService.$queryRaw<{ data: any }[]>`
+                SELECT data FROM Card WHERE CAST(data AS CHAR) LIKE '%spin%'`;
+            for (const c of cards)
+                for (const n of SpinFrameNames(c.data)) used.add(n);
+        }
+        const orphans = media.filter((m) => !used.has(m.name));
+        for (const m of orphans) {
             await DeleteFile(m.name);
         }
         await this.prismaService.media.deleteMany({
-            where: { name: { in: media.map((m) => m.name) } },
+            where: { name: { in: orphans.map((m) => m.name) } },
         });
     }
     async deleteForCard(cardId: number) {
@@ -81,6 +91,7 @@ export class MediaService {
             [card.back_image_name, card.front_image_name, card.document_name]
                 .filter(Boolean),
         );
+        for (const n of SpinFrameNames(card.data)) names.add(n);
         for (const name of names) {
             await this.delete(name);
         }
