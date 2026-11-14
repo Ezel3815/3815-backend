@@ -144,6 +144,7 @@ export class PipelineService implements OnApplicationBootstrap {
             colorize: c.colorize !== false, mainColor: c.mainColor || "#009688", hiColor: c.hiColor || "#673ab7", hideNew: !!c.hideNew,
             threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
             polishWithFile: c.polishWithFile !== false, cutout: c.cutout !== false,
+            use3d: c.use3d !== false, replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back",
         };
         const job = await this.prisma.pipelineJob.create({
             data: { title: body.title || `${config.subject}`, user_id: user.id, config: config as any, state: { subjectId: null, doctors, createdAt: Date.now() } as any, log: [] },
@@ -302,6 +303,8 @@ export class PipelineService implements OnApplicationBootstrap {
             },
             updateCard: async (deckId, cid, type, data) => { await this.cards.update(user, deckId, cid, { type, data } as any); },
             deleteCard: async (deckId, cid) => { await this.cards.delete(undefined, deckId, cid); },
+            loadModels: async () => (await this.prisma.model3D.findMany({ orderBy: { name: "asc" } }))
+                .map((m) => ({ id: m.id, name: m.name, aliases: m.aliases ?? "", category: m.category ?? "", file: m.file_name })),
             attach: async (cid, png) => {
                 const m = await this.media.create({ buffer: png, originalname: `card_${cid}.png`, mimetype: "image/png", size: png.length } as any, MediaType.IMAGE);
                 await this.prisma.card.update({ where: { id: cid }, data: { back_image_name: m.name } });
@@ -326,6 +329,7 @@ export class PipelineService implements OnApplicationBootstrap {
             threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
             polishWithFile: true, cutout: c.cutout !== false,
             optQuality: c.optQuality !== false, optDups: c.optDups !== false, optImages: c.optImages !== false, pictureMode: mode,
+            use3d: c.use3d !== false, replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back",
         };
         const lectures: Lecture[] = ids.map((id): Lecture => ({
             id: `d${id}`, name: byId.get(id)!.title, fileName: "", size: 0, status: "queued", msg: "", progress: "", stage: "written",
@@ -605,7 +609,7 @@ export class PipelineService implements OnApplicationBootstrap {
             const t = report?.totals;
             const lines = [`Job: ${title}`, `Status: ${status}`, message];
             if (t && report?.kind === "mcq") lines.push("", `Files: ${t.lecturesDone}/${t.lectures}`, `Questions: ${t.questions}`, `Answer chosen by the AI: ${t.aiPicked}`, `Need your check: ${t.attention}`);
-            else if (t) lines.push("", `Lectures: ${t.lecturesDone}/${t.lectures}`, `Cards: ${t.cards}`, `Fixed: ${t.fixed}`, `Deleted: ${t.deleted}`, `Pictures added: ${t.pictures}`, `Need your attention: ${t.attention}`);
+            else if (t) lines.push("", `Lectures: ${t.lecturesDone}/${t.lectures}`, `Cards: ${t.cards}`, `Fixed: ${t.fixed}`, `Deleted: ${t.deleted}`, `3D models added: ${t.models ?? 0}`, `Pictures added: ${t.pictures}`, `Need your attention: ${t.attention}`);
             for (const l of report?.lectures ?? []) if (l.error) lines.push(`Problem in "${l.name}": ${l.error}`);
             const url = process.env.DASHBOARD_URL; lines.push("", url ? `Open the report: ${url.replace(/\/$/, "")}/pipeline` : "Open the dashboard > Pipeline to see the full report.");
             const subject = status === "done" ? `✅ Pipeline finished: ${title}` : status === "waiting" ? `⏸ Pipeline waiting for AI keys: ${title}` : `⚠️ Pipeline stopped: ${title}`;
@@ -626,7 +630,7 @@ export class PipelineService implements OnApplicationBootstrap {
             totals: {
                 lectures: ls.length, lecturesDone: ls.filter(({ l }) => l.stage === "done").length, cards: sum((l) => l.saved.length || l.checked || 0),
                 fixed: sum((l) => l.rep?.fixes?.length ?? 0), deleted: sum((l) => l.rep?.deleted?.length ?? 0),
-                pictures: sum((l) => l.rep?.pictures?.length ?? 0), noPicture: sum((l) => l.rep?.noPicture?.length ?? 0), attention: sum((l) => l.rep?.lowConf?.length ?? 0),
+                models: sum((l) => l.rep?.models?.length ?? 0), pictures: sum((l) => l.rep?.pictures?.length ?? 0), noPicture: sum((l) => l.rep?.noPicture?.length ?? 0), attention: sum((l) => l.rep?.lowConf?.length ?? 0),
             },
             styles: (st.doctors as Doctor[]).filter((d) => d.styleGuide).map((d) => ({ doctor: d.name, guide: d.styleGuide })),
             lectures: ls.map(({ d, l }) => ({ doctor: d.name, name: l.name, status: l.stage === "done" ? "done" : l.status, error: l.stage === "done" ? "" : l.msg, cards: l.saved.length || l.checked || 0, ...l.rep })),
