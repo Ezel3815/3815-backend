@@ -36,6 +36,7 @@ import { DecksCardsService } from "./decks-cards.service";
 import { log } from "console";
 import { DeckOutDto } from "src/dtos/decks/deck_out_dto";
 import { CopyFile } from "src/utils/files.utils";
+import { SpinFrameNames } from "src/utils/spin.utils";
 
 @Injectable()
 export class DecksService {
@@ -466,7 +467,7 @@ async readHierarchy1(user: User, parentId: number | null) {
         const renamed = new Map<string, string | null>();
         const names = [
             ...new Set(
-                [card.front_image_name, card.back_image_name, card.document_name].filter(
+                [card.front_image_name, card.back_image_name, card.document_name, ...SpinFrameNames(card.data)].filter(
                     Boolean,
                 ),
             ),
