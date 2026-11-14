@@ -1,13 +1,13 @@
 import { AnswerType, Card, CardAnswer } from "@prisma/client";
 import { GetFileUrl } from "src/utils/files.utils";
-import { WithSpinUrls } from "src/utils/spin.utils";
+import { WithModelUrl } from "src/utils/model.utils";
 
 export function CardOutDto(card: Card & { answers: CardAnswer[] }) {
     return {
         order: card.order,
         deck_id: card.deck_id,
         id: card.id,
-        data: WithSpinUrls(card.data),
+        data: WithModelUrl(card.data),
         front_image_url: card.front_image_name
             ? GetFileUrl(card.front_image_name)
             : null,
