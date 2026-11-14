@@ -46,13 +46,13 @@ export function GetRandomNameForFile(file: Express.Multer.File) {
 }
 
 export async function SaveFile(name: string, buffer: Buffer): Promise<string> {
-    const isPdf = name.toLowerCase().endsWith(".pdf");
+    const isRaw = /\.(pdf|glb|gltf)$/i.test(name); // not pictures: stored as raw files
     const result = await new Promise<any>((resolve, reject) => {
         cloudinary.uploader
             .upload_stream(
                 {
                     public_id: name,
-                    resource_type: isPdf ? "raw" : "image",
+                    resource_type: isRaw ? "raw" : "image",
                     folder: "soalix",
                 },
                 (error, result) => {
@@ -73,10 +73,11 @@ export async function CopyFile(url: string): Promise<string> {
         throw new Error(`Cannot copy a file that is not on Cloudinary: ${url}`);
     const path = url.split("?")[0];
     const isPdf = path.toLowerCase().includes(".pdf");
+    const isModel = /\.(glb|gltf)$/i.test(path);
     const ext = isPdf ? "pdf" : (path.split(".").pop() ?? "png");
     const result = await cloudinary.uploader.upload(url, {
         public_id: `${uuid()}.${ext}`,
-        resource_type: isPdf ? "raw" : "image",
+        resource_type: isPdf || isModel ? "raw" : "image",
         folder: "soalix",
     });
     return result.secure_url;
@@ -84,6 +85,12 @@ export async function CopyFile(url: string): Promise<string> {
 
 export async function DeleteFile(name: string) {
     if (!name.startsWith("http")) return;
+    if (/\.(glb|gltf)(\?|$)/i.test(name)) {
+        // raw files keep their extension in the public id
+        const m = name.match(/(soalix\/[^/?]+)/);
+        if (m) await cloudinary.uploader.destroy(m[1], { resource_type: "raw" });
+        return;
+    }
     const isPdf = name.toLowerCase().includes(".pdf");
     const matches = name.match(/soalix\/([^./]+)/);
     if (matches) {
@@ -101,6 +108,8 @@ export function ToStoredFileName(url: string): string {
     if (url.includes("res.cloudinary.com") && url.includes(seg))
         return url.replace(seg, "/");
     if (!url.startsWith("http")) return url;
+    // only our own /public/ URLs are turned back into names; other hosts stay as links
+    if (!url.startsWith(`${process.env.PROTOCOL}://${process.env.HOST}`)) return url;
     const i = url.indexOf("/public/");
     return i >= 0 ? url.slice(i + "/public/".length) : url;
 }
