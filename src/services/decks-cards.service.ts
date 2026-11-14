@@ -1,551 +1,631 @@
-import { invalidateHierarchy } from "src/utils/hierarchy-cache";
-import { AnswerType, DeckType, User, UserRole } from "@prisma/client";
-import { PrismaService } from "nestjs-prisma";
-import { CardOutDto } from "src/dtos/cards/card.out-dto";
-import { ChangeCardsOrderDto } from "src/dtos/cards/change-cards-order.dto";
-import { CreateCardDto } from "src/dtos/cards/create-card.dto";
-import { UpdateCardDto } from "src/dtos/cards/update-card.dto";
-import { FindQueryDto } from "src/dtos/find-query.dto";
-import { DecksService } from "./decks.service";
-import { GenerateBadRequestException } from "src/exception/bad-request.exception";
-import { MediaService } from "./media.service";
-import { NormalizeSpin, SpinFrameNames } from "src/utils/spin.utils";
+import { Inject, Injectable, forwardRef } from "@nestjs/common";
+import { JwtService } from "@nestjs/jwt";
 import {
-    BadRequestException,
-    ForbiddenException,
-    Inject,
-    Injectable,
-    NotFoundException,
-    forwardRef,
-} from "@nestjs/common";
-import { AnswerCardDto } from "src/dtos/cards/answer-card.dto";
-import { BulkUpdateAnswersDto } from "src/dtos/cards/bulk-update-answers.dto";
-import { MoveCardsDto } from "src/dtos/cards/move-cards.dto";
+    DeckType,
+    MediaType,
+    Prisma,
+    User,
+    UserRole,
+    UserStatus,
+} from "@prisma/client";
+import { IncomingMessage } from "http";
+import { PrismaService } from "nestjs-prisma";
+import { JwtConstant } from "src/constants/jwt.constant";
+import { LoginDto } from "src/dtos/auth/login.dto";
+import { RegisterDto } from "src/dtos/auth/register.dto";
+import { CreateDeckDto } from "src/dtos/decks/create-deck.dto";
+import { cachedHierarchy, invalidateHierarchy } from "src/utils/hierarchy-cache";
+import { DeckRecursiveOutDto } from "src/dtos/decks/deck-recursive.out-dto";
+import { ShareDeckDto } from "src/dtos/decks/share-deck.dto";
+import { UpdateDeckDto } from "src/dtos/decks/update-deck.dto";
+import { FindQueryDto } from "src/dtos/find-query.dto";
+import { CreateUserDto } from "src/dtos/users/create-user.dto";
+import { UpdateMeDto } from "src/dtos/users/update-me.dto";
+import { UpdatePasswordDto } from "src/dtos/users/update-password.dto";
+import { UpdateUserDto } from "src/dtos/users/update-user.dto";
+import { UserOutDto } from "src/dtos/users/user.out-dto";
+import { GenerateBadRequestException } from "src/exception/bad-request.exception";
+import { GenerateUnauthorizedException } from "src/exception/unauthorized.exception";
+import { GenerateUnprocessableEntityException } from "src/exception/unprocessable-entity.exception";
+import { generateRandomCode } from "src/utils/code-generation.utils";
+import uuid from "uuid";
+import { MediaService } from "./media.service";
+import { DocumentOutDto } from "src/dtos/decks/document.out-dto";
+import { UserDeckOutDto } from "src/dtos/decks/user-deck.out-dto";
+import { DecksCardsService } from "./decks-cards.service";
 import { log } from "console";
-import { xpForAnswer, getLevelInfo } from "src/utils/level.utils";
-import { isSameUtcDay, isYesterday, startOfUtcDay } from "src/utils/date.utils";
-import { checkAndUnlockAchievements } from "src/utils/achievement.utils";
-import { recordCardMasteryIfNew } from "src/utils/quests.utils";
-import { MosaicService } from "../mosaic/mosaic.service";
-
-// Hard ceiling on a single bulk-answer request. Prevents one request from
-// insta-completing daily/monthly quests, and keeps the loop below from
-// running an unbounded number of DB round-trips.
-const MAX_BULK_ANSWERS = 25;
+import { DeckOutDto } from "src/dtos/decks/deck_out_dto";
+import { CopyFile } from "src/utils/files.utils";
+import { ModelFileNames } from "src/utils/model.utils";
 
 @Injectable()
-export class DecksCardsService {
+export class DecksService {
     constructor(
         private prismaService: PrismaService,
-        @Inject(forwardRef(() => DecksService))
-        private decksService: DecksService,
         private mediaService: MediaService,
-        private mosaicService: MosaicService,
+        @Inject(forwardRef(() => DecksCardsService))
+        private decksCardsService: DecksCardsService,
     ) {}
 
-    async create(user: User, deckId: number, createCardDto: CreateCardDto) {
-        // if (
-        //     !(await this.decksService.checkOwnership(
-        //         user,
-        //         deckId,
-        //         {
-        //             editable: true,
-        //         },
-        //         { type: DeckType.CARDS_DECK },
-        //     ))
-        // )
-        //     GenerateBadRequestException([
-        //         "You can't edit a deck that you don't own",
-        //     ]);
-
-        const lastDeckCard = await this.prismaService.card.findFirst({
-            where: {
-                deck_id: deckId,
-            },
-            orderBy: { order: "desc" },
-        });
-
-        const card = await this.prismaService.card.create({
-            data: {
-                deck_id: deckId,
-                type: createCardDto.type,
-                document_name: createCardDto.document_name,
-                document_title: createCardDto.document_title,
-                back_image_name: createCardDto.back_image_name,
-                front_image_name: createCardDto.front_image_name,
-                data: JSON.stringify(this.spinSafe(createCardDto.data)),
-                order: lastDeckCard ? lastDeckCard.order + 1 : 1,
-            },
-            include: {
-                answers: true,
-            },
-        });
-
-        return CardOutDto(card);
-    }
-
-    async changeCardsOrder(
+    async checkOwnership(
         user: User,
         deckId: number,
-        changeCardsOrderDto: ChangeCardsOrderDto,
+        extraUserDeckFilters?: Prisma.UserDeckWhereInput,
+        extraDeckFilters?: Prisma.DeckWhereInput,
     ) {
-        if (
-            !(await this.decksService.checkOwnership(
-                user,
-                deckId,
-                {
-                    editable: true,
+        if (user?.role != UserRole.ADMIN) {
+            // CRITICAL: this findFirst was never awaited, so `userDeck` was
+            // always a pending Promise — never falsy — meaning this check
+            // silently passed for EVERY user on EVERY deck, regardless of
+            // actual ownership. This is the real root cause of "answered a
+            // card in another user's private deck" (BUG #1) and affected
+            // every caller of checkOwnership, not just card answers.
+            const userDeck = await this.prismaService.userDeck.findFirst({
+                where: {
+                    user_id: user.id,
+                    deck_id: deckId,
+                    ...(extraUserDeckFilters ?? {}),
+                    deck: extraDeckFilters ?? {},
                 },
-                { type: DeckType.CARDS_DECK },
-            ))
-        )
+            });
+
+            if (!userDeck) return false;
+        }
+        return true;
+    }
+
+    async create(user: User, createDeckDto: CreateDeckDto) {
+        //TODO: check for circualr decks (one is child on one and the second is also child of the first)
+
+        if (createDeckDto.parent_id) {
+            const parent = await this.prismaService.deck.findFirst({
+                where: { id: createDeckDto.parent_id },
+            });
+
+            if (!parent || parent.type != DeckType.PACKAGE_DECK) {
+                GenerateBadRequestException([
+                    "You can't add sub-deck to this deck",
+                ]);
+            }
+        }
+
+        const deck = await this.prismaService.deck.create({
+            data: {
+                title: createDeckDto.title,
+                type: createDeckDto.type,
+                by_admin: user.role == UserRole.ADMIN,
+                parent_id: createDeckDto.parent_id,
+                public: createDeckDto.public,
+                visible: createDeckDto.visible,
+                order: createDeckDto.order ?? undefined
+            },
+        });
+
+        const userDeck = await this.prismaService.userDeck.create({
+            data: {
+                deck_id: deck.id,
+                user_id: user.id,
+                sharable: true,
+                editable: true,
+            },
+            include: {
+                deck: { include: { cards: { include: { answers: true } } } },
+            },
+        });
+
+        invalidateHierarchy(); // new deck must show up right away for everyone
+        return UserDeckOutDto(userDeck);
+    }
+
+    async read(findQueryDto: FindQueryDto) {
+        if (findQueryDto?.filter?.by_admin) {
+            findQueryDto.filter.by_admin =
+                findQueryDto.filter.by_admin == "true";
+        }
+        const decks = await this.prismaService.deck.findMany({
+            skip: findQueryDto.skip,
+            take: findQueryDto.limit,
+            where: findQueryDto.filter ?? {},
+            orderBy: findQueryDto.sort ?? { created_at: "desc" },
+            include: { parent: true },
+        });
+
+        const count = await this.prismaService.deck.count({
+            where: findQueryDto.filter ?? {},
+        });
+
+        return { count, data: decks };
+    }
+
+    generateRecursiveIncludeQuery(
+        user: User,
+        level: number = 8,
+    ): Prisma.DeckInclude {
+        if (level == 0)
+            return {
+                cards: {
+                    include: { answers: { where: { user_id: user.id } } },
+                },
+                users: {
+                     where: { user_id: user.id,},
+                  select: { user_id: true } }, // Required to check sharing
+
+            };
+
+        return {
+            cards: { include: { answers: { where: { user_id: user.id } } } },
+            
+            users: {  where: { user_id: user.id,},
+                        select: { user_id: true } }, 
+
+            children:
+                user.role == UserRole.ADMIN
+                    ? {
+                          include: this.generateRecursiveIncludeQuery(
+                              user,
+                              level - 1,
+                          ),
+                          orderBy: {
+                              order: "asc",
+                          },
+                      }
+                    : {
+                        
+                          include: this.generateRecursiveIncludeQuery(
+                              user,
+                              level - 1,
+                          ),
+                          orderBy: {
+                              order: "asc",
+                          },
+                          
+                      },
+        };
+    }
+
+    async readHierarchy(user: User) {
+        return cachedHierarchy(user.id, async () => {
+            const decks: any = await this.prismaService.deck.findMany({
+                where: {
+                    by_admin: true,
+                    parent_id: null,
+                    ...(user.role == UserRole.ADMIN ? {} : { visible: true }),
+                },
+                include: this.generateRecursiveIncludeQuery(user, 9),
+                orderBy: { order: "asc" },
+            });
+            return decks.map((deck) => DeckRecursiveOutDto(user, deck));
+        });
+    }
+
+
+async readHierarchy1(user: User, parentId: number | null) {
+    const decks = await this.prismaService.deck.findMany({
+        where: {
+            by_admin: true,
+            parent_id: parentId,
+            ...(user.role == UserRole.ADMIN ? {} : { visible: true }),
+        },
+        include: {
+            cards: {
+                include: {
+                    answers: { where: { user_id: user.id } },
+                },
+            },
+            users: {
+                where: { user_id: user.id },
+                select: { user_id: true },
+            },
+            _count: {
+                select: {
+                    children: true,
+                },
+            },
+        },
+        orderBy: {
+            order: "asc",
+        },
+    });
+
+    return decks.map((deck) => DeckOutDto(user, deck));
+}
+
+    async readMine(user: User) {
+        const userDeck = await this.prismaService.userDeck.findMany({
+            where: { user_id: user.id, deck: { by_admin: false } },
+            include: {
+                deck: {
+                    include: {
+                        cards: {
+                            include: {
+                                answers: { where: { user_id: user.id } },
+                            },
+                        },
+                    },
+                },
+            },
+        });
+
+        return userDeck.map((ud) => UserDeckOutDto(ud));
+    }
+
+    async readOne(id: number) {
+        const deck = await this.prismaService.deck.findUnique({
+            where: { id },
+        });
+
+        return deck;
+    }
+
+    async update(user: User, id: number, updateDeckDto: UpdateDeckDto) {
+        if (!(await this.checkOwnership(user, id, { editable: true })))
             GenerateBadRequestException([
                 "You can't edit a deck that you don't own",
             ]);
 
-        await this.prismaService.$transaction(
-            changeCardsOrderDto.cards_ids.map((id, index) =>
-                this.prismaService.card.update({
-                    where: { id, deck_id: deckId },
-                    data: { order: index },
-                }),
-            ),
-        );
-
-        return true;
-    }
-
-    /**
-     * Study access (read / answer cards) is NOT the same as edit ownership.
-     * A user may study a deck if it is their own / shared with them, or it is
-     * an admin deck that isn't locked behind a code they haven't entered (a
-     * locked ancestor locks everything below it — same rule as the deck tree).
-     * Admins may access everything. Using the edit-ownership check here made
-     * every regular user get "You can't edit a deck that you don't own" when
-     * opening or answering cards of admin decks.
-     */
-    private async assertCanStudyDecks(user: User, deckIds: number[]) {
-        const ids = [...new Set(deckIds)];
-        if (ids.length === 0) return;
-
-        const decks = new Map<
-            number,
-            { id: number; parent_id: number | null; by_admin: boolean; public: boolean }
-        >();
-        let pending = ids;
-        while (pending.length > 0) {
-            const rows = await this.prismaService.deck.findMany({
-                where: { id: { in: pending } },
-                select: { id: true, parent_id: true, by_admin: true, public: true },
+        // Moving a deck under a parent: apply the same rule create() already
+        // has. Only a "Decks Package" can hold sub-decks. Before this check the
+        // move was saved silently, but the app treats a Cards Deck as a plain
+        // list of cards (and an EMPTY Cards Deck counts as locked, which hides
+        // everything inside it).
+        if (updateDeckDto.parent_id) {
+            const existing = await this.prismaService.deck.findUnique({
+                where: { id },
+                select: { parent_id: true },
             });
-            rows.forEach((r) => decks.set(r.id, r));
-            pending = [
-                ...new Set(
-                    rows
-                        .map((r) => r.parent_id)
-                        .filter((p) => p !== null && !decks.has(p)),
-                ),
-            ];
-        }
-        if (ids.some((id) => !decks.has(id)))
-            throw new NotFoundException("Deck not found");
-        if (user.role === UserRole.ADMIN) return;
+            // only check when the parent is actually changing, so editing the
+            // title of an older deck is never blocked
+            if (existing && existing.parent_id !== updateDeckDto.parent_id) {
+                if (updateDeckDto.parent_id === id)
+                    GenerateBadRequestException([
+                        "A deck can't be its own parent",
+                    ]);
 
-        const linkedRows = await this.prismaService.userDeck.findMany({
-            where: { user_id: user.id, deck_id: { in: [...decks.keys()] } },
-            select: { deck_id: true },
-        });
-        const linked = new Set(linkedRows.map((r) => r.deck_id));
+                const parent = await this.prismaService.deck.findUnique({
+                    where: { id: updateDeckDto.parent_id },
+                });
+                if (!parent || parent.type != DeckType.PACKAGE_DECK)
+                    GenerateBadRequestException([
+                        "You can't add a sub-deck to this deck. Set its type to Decks Package first (a Cards Deck can only hold cards).",
+                    ]);
 
-        // The message names the deck and the reason, so "locked" can be traced to
-        // the exact Deck row (public = code-locked, or not an admin deck).
-        const deny = (deckId: number, reason: string) => {
-            throw new ForbiddenException(
-                `You don't have access to this deck (deck ${deckId}: ${reason})`,
-            );
-        };
-
-        for (const id of ids) {
-            const own = decks.get(id);
-            if (!own.by_admin) {
-                if (!linked.has(own.id)) deny(own.id, "not an admin deck and not linked to you");
-                continue;
-            }
-            let cur = own;
-            while (cur) {
-                if (cur.public && !linked.has(cur.id)) deny(cur.id, "marked public (code-locked) and not linked to you");
-                cur =
-                    cur.parent_id !== null ? decks.get(cur.parent_id) : undefined;
+                // walk up from the new parent: it must not sit inside this deck
+                let cursor: number | null = parent.parent_id;
+                for (let hops = 0; cursor != null && hops < 50; hops++) {
+                    if (cursor === id)
+                        GenerateBadRequestException([
+                            "A deck can't be moved inside one of its own sub-decks",
+                        ]);
+                    const up = await this.prismaService.deck.findUnique({
+                        where: { id: cursor },
+                        select: { parent_id: true },
+                    });
+                    cursor = up?.parent_id ?? null;
+                }
             }
         }
-    }
 
-    async read(user: User, deckId: number) {
-        await this.assertCanStudyDecks(user, [deckId]);
+        if (updateDeckDto.type) {
+            const current = await this.prismaService.deck.findUnique({
+                where: { id },
+                include: { _count: { select: { children: true, cards: true } } },
+            });
+            if (current && current.type !== updateDeckDto.type) {
+                if (
+                    updateDeckDto.type === DeckType.PACKAGE_DECK &&
+                    current._count.cards > 0
+                )
+                    GenerateBadRequestException([
+                        "Move this deck's cards out before turning it into a Decks Package",
+                    ]);
+                if (
+                    updateDeckDto.type === DeckType.CARDS_DECK &&
+                    current._count.children > 0
+                )
+                    GenerateBadRequestException([
+                        "Move the sub-decks out before turning this package into a Cards Deck",
+                    ]);
+            }
+        }
 
-        const cards = await this.prismaService.card.findMany({
-            where: { deck_id: deckId },
-            include: { answers: {where: {user_id: user.id}} },
-        });
-
-        return cards.map(CardOutDto);
-    }
-
-    async update(
-        user: User,
-        deckId: number,
-        id: number,
-        updateCardDto: UpdateCardDto,
-    ) {
-        // if (
-        //     !(await this.decksService.checkOwnership(
-        //         user,
-        //         deckId,
-        //         {
-        //             editable: true,
-        //         },
-        //         { type: DeckType.CARDS_DECK },
-        //     ))
-        // )
-        //     GenerateBadRequestException([
-        //         "You can't edit a deck that you don't own",
-        //     ]);
-
-        const safeData = this.spinSafe(updateCardDto.data);
-        const before = await this.prismaService.card.findUnique({
-            where: { id },
-            select: { data: true },
-        });
-
-        const card = await this.prismaService.card.update({
+        const deck = await this.prismaService.deck.update({
             where: {
                 id,
-                deck_id: deckId,
             },
             data: {
-                type: updateCardDto.type,
-                document_name: updateCardDto.document_name,
-                document_title: updateCardDto.document_title,
-                back_image_name: updateCardDto.back_image_name,
-                front_image_name: updateCardDto.front_image_name,
-                data: JSON.stringify(safeData),
+                title: updateDeckDto.title,
+                parent_id: updateDeckDto.parent_id,
+                public: updateDeckDto.public,
+                visible: updateDeckDto.visible,
+                type: updateDeckDto.type,
+                order: updateDeckDto.order ?? undefined
             },
         });
 
-        // photos removed from the 360° set are no longer used: delete their files
-        const kept = new Set(SpinFrameNames(safeData));
-        for (const name of SpinFrameNames(before?.data)) {
-            if (!kept.has(name)) await this.mediaService.delete(name);
-        }
-
-        return card;
+        invalidateHierarchy();
+        return deck;
     }
 
-    private spinSafe(data: object): object {
+    async deleteIfOrphan(deckId: number) {
+        const deck = await this.prismaService.deck.findUnique({
+            where: {
+                id: deckId,
+            },
+            include: {
+                cards: true,
+            },
+        });
+
+        if (deck.by_admin) return;
+
+        const count = await this.prismaService.userDeck.count({
+            where: {
+                deck_id: deckId,
+            },
+        });
+
+        if (count == 0) {
+            await this.delete(deckId);
+        }
+    }
+
+    // Copies a deck with everything inside it (sub-decks, cards, images/PDFs)
+    // into another Decks Package. NOT copied: students' answers/progress, codes
+    // and share links. If anything fails, the partial copy is removed again.
+    async copy(user: User, id: number, targetParentId: number | null) {
+        const source = await this.prismaService.deck.findUnique({ where: { id } });
+        if (!source) GenerateBadRequestException(["Deck not found"]);
+
+        if (targetParentId) {
+            const target = await this.prismaService.deck.findUnique({
+                where: { id: targetParentId },
+            });
+            if (!target) GenerateBadRequestException(["Target deck not found"]);
+            if (target.type !== DeckType.PACKAGE_DECK)
+                GenerateBadRequestException([
+                    "The target must be a Decks Package",
+                ]);
+            // never into itself or one of its own sub-decks
+            let cursor: number | null = targetParentId;
+            for (let i = 0; cursor && i < 50; i++) {
+                if (cursor === id)
+                    GenerateBadRequestException([
+                        "A deck can't be copied into itself or into its own sub-decks",
+                    ]);
+                const up = await this.prismaService.deck.findUnique({
+                    where: { id: cursor },
+                    select: { parent_id: true },
+                });
+                cursor = up?.parent_id ?? null;
+            }
+        }
+
+        const created: number[] = [];
         try {
-            return NormalizeSpin(data);
+            // copying next to the original: mark it so the two can be told apart
+            const suffix = source.parent_id === targetParentId ? " (copy)" : "";
+            const root = await this.copyTree(user, id, targetParentId, suffix, created, 0);
+            invalidateHierarchy();
+            return { id: root.id, title: root.title, decks: created.length };
         } catch (e) {
-            GenerateBadRequestException([e.message]);
+            for (const deckId of [...created].reverse()) {
+                try {
+                    await this.delete(deckId);
+                } catch {}
+            }
+            invalidateHierarchy();
             throw e;
         }
     }
 
-    async delete(user: User | undefined, deckId: number, id: number) {
-        if (
-            user != undefined &&
-            !(await this.decksService.checkOwnership(
-                user,
-                deckId,
-                {
-                    editable: true,
-                },
-                { type: DeckType.CARDS_DECK },
-            ))
-        )
-            GenerateBadRequestException([
-                "You can't edit a deck that you don't own",
-            ]);
+    private async copyTree(
+        user: User,
+        sourceId: number,
+        parentId: number | null,
+        titleSuffix: string,
+        created: number[],
+        depth: number,
+    ) {
+        if (depth > 20) throw new Error("Deck tree is too deep to copy");
+        const src = await this.prismaService.deck.findUnique({
+            where: { id: sourceId },
+            include: {
+                cards: { orderBy: { order: "asc" } },
+                children: { orderBy: { order: "asc" } },
+            },
+        });
 
-        await this.mediaService.deleteForCard(id);
+        const deck = await this.prismaService.deck.create({
+            data: {
+                title: src.title + titleSuffix,
+                type: src.type,
+                by_admin: user.role == UserRole.ADMIN,
+                parent_id: parentId,
+                public: src.public,
+                visible: src.visible,
+                order: src.order,
+            },
+        });
+        created.push(deck.id);
+        await this.prismaService.userDeck.create({
+            data: {
+                deck_id: deck.id,
+                user_id: user.id,
+                sharable: true,
+                editable: true,
+            },
+        });
+
+        for (const card of src.cards) await this.copyCard(card, deck.id);
+        for (const child of src.children)
+            await this.copyTree(user, child.id, deck.id, "", created, depth + 1);
+        return deck;
+    }
+
+    private async copyCard(card: any, deckId: number) {
+        // old media name -> new media name (each card needs its own files)
+        const renamed = new Map<string, string | null>();
+        const names = [
+            ...new Set(
+                [card.front_image_name, card.back_image_name, card.document_name, ...ModelFileNames(card.data)].filter(
+                    Boolean,
+                ),
+            ),
+        ] as string[];
+        await Promise.all(
+            names.map(async (name) => {
+                const media = await this.prismaService.media.findUnique({ where: { name } });
+                if (!media) {
+                    renamed.set(name, null); // orphaned reference: nothing to copy
+                    return;
+                }
+                const newName = await CopyFile(name);
+                await this.prismaService.media.create({
+                    data: { name: newName, type: media.type },
+                });
+                renamed.set(name, newName);
+            }),
+        );
+
+        // card.data may mention the old file names: point them at the copies
+        let json = JSON.stringify(card.data ?? null);
+        for (const [oldName, newName] of renamed)
+            if (newName) json = json.split(oldName).join(newName);
+
+        const pick = (n: string | null) => (n ? (renamed.get(n) ?? null) : null);
+        await this.prismaService.card.create({
+            data: {
+                deck_id: deckId,
+                order: card.order,
+                type: card.type,
+                data: JSON.parse(json),
+                document_title: card.document_title,
+                document_name: pick(card.document_name),
+                front_image_name: pick(card.front_image_name),
+                back_image_name: pick(card.back_image_name),
+            },
+        });
+    }
+
+    async delete(id: number) {
+        const cards = await this.prismaService.card.findMany({
+            where: { deck_id: id },
+        });
+
+        for (let card of cards) {
+            await this.decksCardsService.delete(undefined, id, card.id);
+        }
 
         await this.prismaService.$transaction([
-            this.prismaService.cardAnswer.deleteMany({
+            this.prismaService.userDeck.deleteMany({
                 where: {
-                    card_id: id,
+                    deck_id: id,
                 },
             }),
-            this.prismaService.media.deleteMany({
+
+            this.prismaService.card.deleteMany({
                 where: {
-                    OR: [
-                        {
-                            back_card: {
-                                id,
-                            },
-                        },
-                        {
-                            front_card: {
-                                id,
-                            },
-                        },
-                        {
-                            document_card: {
-                                id,
-                            },
-                        },
-                    ],
+                    deck_id: id,
                 },
             }),
-            this.prismaService.card.delete({
+
+            this.prismaService.codeDeck.deleteMany({
                 where: {
-                    id,
-                    deck_id: deckId,
+                    deck_id: id,
                 },
+            }),
+
+            this.prismaService.deck.delete({
+                where: { id },
             }),
         ]);
-    }
-
-    async answer(user: User, cardId: number, answerCardDto: AnswerCardDto) {
-        // BUG #2: NONE isn't a real study action — never let it count.
-        if (answerCardDto.answer === AnswerType.NONE) {
-            throw new BadRequestException(
-                "answer cannot be NONE — that isn't a valid study action",
-            );
-        }
-
-        // BUG #1 / #6: load the card once, up front, and use it both to
-        // return a clean 404 for a nonexistent card and to check that the
-        // caller is actually allowed to study this deck before anything is
-        // written. Previously nothing here checked either.
-        const card = await this.prismaService.card.findUnique({
-            where: { id: cardId },
-            include: { deck: true },
-        });
-        if (!card) {
-            throw new NotFoundException("Card not found");
-        }
-        await this.assertCanStudyDecks(user, [card.deck_id]);
-
-        const existing = await this.prismaService.cardAnswer.findUnique({
-            where: { user_id_card_id: { user_id: user.id, card_id: cardId } },
-        });
-
-        await this.prismaService.cardAnswer.upsert({
-            where: { user_id_card_id: { user_id: user.id, card_id: cardId } },
-            create: {
-                user_id: user.id,
-                card_id: cardId,
-                answer: answerCardDto.answer,
-            },
-            update: { answer: answerCardDto.answer, updated_at: new Date() },
-        });
-
-        const levelBefore = getLevelInfo(
-            (await this.prismaService.user.findUnique({ where: { id: user.id } })).xp,
-        ).level;
-
-        // XP only on a genuinely new answer — re-reviewing a card you've
-        // already answered shouldn't let XP be farmed repeatedly.
-        if (!existing) {
-            const xpGained = xpForAnswer(answerCardDto.answer);
-            if (xpGained > 0) {
-                await this.prismaService.user.update({
-                    where: { id: user.id },
-                    data: { xp: { increment: xpGained } },
-                });
-            }
-        }
-
-        const userAfterXp = await this.prismaService.user.findUnique({
-            where: { id: user.id },
-        });
-        const levelAfter = getLevelInfo(userAfterXp.xp).level;
-        const leveledUp = levelAfter > levelBefore;
-
-        if (leveledUp) {
-            // FIX: answering several cards in quick succession fires
-            // overlapping requests, each of which could independently see
-            // "I just crossed a level boundary" and write its own duplicate
-            // event — this is what produced repeated identical posts in the
-            // feed. Skip if today's post for this exact level already exists.
-            const alreadyPosted = await this.prismaService.activityEvent.findFirst({
-                where: {
-                    user_id: user.id,
-                    type: "level_up",
-                    title: `Reached Level ${levelAfter}`,
-                },
-            });
-            if (!alreadyPosted) {
-                await this.prismaService.activityEvent.create({
-                    data: {
-                        user_id: user.id,
-                        type: "level_up",
-                        title: `Reached Level ${levelAfter}`,
-                    },
-                });
-            }
-        }
-
-        const streakResult = await this.updateStreak(user.id);
-
-        // BUG #4: mastery must never go backwards. Recording it as a
-        // one-per-card-per-day achievement (instead of counting the card's
-        // *current* answer) means re-answering the same card worse later
-        // today can't erase today's progress.
-        if (
-            answerCardDto.answer === AnswerType.EASY ||
-            answerCardDto.answer === AnswerType.GOOD
-        ) {
-            await recordCardMasteryIfNew(this.prismaService, user.id, cardId);
-        }
-
-        // Chapter-completion check — only worth checking when this
-        // answer was for a card that had never been answered before,
-        // since that's the only way a deck can newly become 100%.
-        let chapterCompleted = false;
-        let chapterTitle: string | null = null;
-        if (!existing) {
-            const totalCards = await this.prismaService.card.count({
-                where: { deck_id: card.deck_id },
-            });
-            const answeredCards = await this.prismaService.cardAnswer.count({
-                where: {
-                    user_id: user.id,
-                    card: { deck_id: card.deck_id },
-                },
-            });
-            if (totalCards > 0 && answeredCards === totalCards) {
-                chapterCompleted = true;
-                chapterTitle = card.deck.title;
-                await this.prismaService.activityEvent.create({
-                    data: {
-                        user_id: user.id,
-                        type: "chapter_completed",
-                        title: chapterTitle,
-                    },
-                });
-            }
-        }
-
-        const newAchievements = await checkAndUnlockAchievements(
-            this.prismaService,
-            user.id,
-        );
-
-        // Mosaic rewards are persisted inside onAnswer() BEFORE the response is
-        // built, and a failure here must never break studying: the next answer
-        // re-evaluates from the ledger and heals any missed award.
-        let mosaic = null;
-        try {
-            mosaic = await this.mosaicService.onAnswer(user.id);
-        } catch (e) {
-            log("mosaic onAnswer failed", e);
-        }
-
-        invalidateHierarchy(user.id);
-        return {
-            mosaic,
-            leveledUp,
-            newLevel: leveledUp ? levelAfter : undefined,
-            streakSaved: streakResult.saved,
-            newStreak: streakResult.saved ? streakResult.newStreak : undefined,
-            chapterCompleted,
-            chapterTitle: chapterCompleted ? chapterTitle : undefined,
-            newAchievements,
-        };
-    }
-
-    /// Studying at all today (any review, first-time or repeat) counts
-    /// toward the streak. Consecutive calendar days increment it,
-    /// missing a day resets it to 1, multiple reviews the same day are
-    /// a no-op (streak already counted for today). Returns whether this
-    /// call was the one that "saved" today's streak, so the caller can
-    /// show a one-time celebration rather than on every card.
-    private async updateStreak(
-        userId: number,
-    ): Promise<{ saved: boolean; newStreak: number }> {
-        const user = await this.prismaService.user.findUnique({
-            where: { id: userId },
-        });
-        const today = startOfUtcDay(new Date());
-
-        if (user.last_study_date && isSameUtcDay(user.last_study_date, today)) {
-            return { saved: false, newStreak: user.current_streak };
-        }
-
-        const newStreak =
-            user.last_study_date && isYesterday(user.last_study_date, today)
-                ? user.current_streak + 1
-                : 1;
-
-        // Atomic claim of "today": with concurrent answer requests, only the
-        // one whose UPDATE actually flips last_study_date reports saved=true.
-        const claimed = await this.prismaService.user.updateMany({
-            where: {
-                id: userId,
-                OR: [{ last_study_date: null }, { last_study_date: { lt: today } }],
-            },
-            data: { current_streak: newStreak, last_study_date: today },
-        });
-
-        return claimed.count === 1
-            ? { saved: true, newStreak }
-            : { saved: false, newStreak: user.current_streak };
-    }
-
-    async bulkAnswer(user: User, bulkUpdateAnswersDto: BulkUpdateAnswersDto) {
-        // BUG #1: a single bulk request could carry an arbitrary number of
-        // cards (e.g. all 120), instantly maxing out the monthly quest.
-        // Cap it to something a real study session could plausibly produce.
-        if (bulkUpdateAnswersDto.answers.length > MAX_BULK_ANSWERS) {
-            throw new BadRequestException(
-                `You can only submit up to ${MAX_BULK_ANSWERS} answers per request`,
-            );
-        }
-
-        for (let answer of bulkUpdateAnswersDto.answers) {
-            await this.answer(user, answer.card_id, { answer: answer.answer });
-        }
-        invalidateHierarchy(user.id);
-    }
-
-    /**
-     * Admin: move cards into another deck (appended after that deck's last card,
-     * keeping the order they were given in). Users' answers follow the card
-     * (they are keyed by card id), so nobody loses progress.
-     */
-    async move(user: User, dto: MoveCardsDto) {
-        const ids = Array.from(new Set(dto.card_ids));
-
-        const target = await this.prismaService.deck.findUnique({
-            where: { id: dto.target_deck_id },
-            select: { id: true },
-        });
-        if (!target) throw new NotFoundException("Target deck not found");
-
-        const cards = await this.prismaService.card.findMany({
-            where: { id: { in: ids } },
-            select: { id: true },
-        });
-        if (cards.length !== ids.length)
-            throw new BadRequestException("Some cards do not exist");
-
-        const last = await this.prismaService.card.findFirst({
-            where: { deck_id: dto.target_deck_id },
-            orderBy: { order: "desc" },
-            select: { order: true },
-        });
-        let next = last ? last.order + 1 : 1;
-
-        await this.prismaService.$transaction(
-            ids.map((id) =>
-                this.prismaService.card.update({
-                    where: { id },
-                    data: { deck_id: dto.target_deck_id, order: next++ },
-                }),
-            ),
-        );
         invalidateHierarchy();
-        return { moved: ids.length, target_deck_id: dto.target_deck_id };
     }
 
+    async unlink(user: User, id: number) {
+        // Same class of bug as inside checkOwnership itself: calling an
+        // async function without awaiting it means you're negating a
+        // Promise, which is never falsy, so this check never fired.
+        if (!(await this.checkOwnership(user, id, { editable: true })))
+            GenerateBadRequestException([
+                "You can't delete a deck that you don't own",
+            ]);
+
+        const deck = await this.prismaService.userDeck.delete({
+            where: { user_id_deck_id: { user_id: user.id, deck_id: id } },
+        });
+
+        await this.deleteIfOrphan(id);
+
+        if (!deck) GenerateBadRequestException(["User does not exist"]);
+
+        return true;
+    }
+
+    async getShareCode(user: User, id: number, shareDeckDto: ShareDeckDto) {
+        // Same missing-await bug as unlink() above.
+        if (!(await this.checkOwnership(user, id, { sharable: true })))
+            GenerateBadRequestException(["You can't share this deck"]);
+
+        const code = generateRandomCode(6);
+
+        const userDeck = await this.prismaService.userDeck.update({
+            where: {
+                user_id_deck_id: {
+                    user_id: user.id,
+                    deck_id: id,
+                },
+            },
+            data: {
+                share_is_editable: shareDeckDto.editable,
+                share_is_sharable: shareDeckDto.sharable,
+                share_code: code,
+            },
+        });
+
+        return { code };
+    }
+
+    async linkByShareCode(user: User, code: string) {
+        const userDeck = await this.prismaService.userDeck.findFirst({
+            where: {
+                share_code: code,
+            },
+        });
+
+        if (!userDeck) GenerateBadRequestException(["Wrong code"]);
+
+        const currentUserDeck = await this.prismaService.userDeck.findFirst({
+            where: {
+                user_id: user.id,
+                deck_id: userDeck.deck_id,
+            },
+        });
+
+        if (currentUserDeck) {
+            await this.prismaService.userDeck.update({
+                where: {
+                    user_id_deck_id: {
+                        user_id: user.id,
+                        deck_id: userDeck.deck_id,
+                    },
+                },
+                data: {
+                    editable:
+                        currentUserDeck.editable || userDeck.share_is_editable,
+                    sharable:
+                        currentUserDeck.sharable || userDeck.share_is_sharable,
+                },
+            });
+        } else {
+            await this.prismaService.userDeck.create({
+                data: {
+                    user_id: user.id,
+                    deck_id: userDeck.deck_id,
+                    editable: userDeck.share_is_editable,
+                    sharable: userDeck.share_is_sharable,
+                },
+            });
+        }
+    }
 }
