@@ -9,6 +9,7 @@ import { FindQueryDto } from "src/dtos/find-query.dto";
 import { DecksService } from "./decks.service";
 import { GenerateBadRequestException } from "src/exception/bad-request.exception";
 import { MediaService } from "./media.service";
+import { NormalizeSpin, SpinFrameNames } from "src/utils/spin.utils";
 import {
     BadRequestException,
     ForbiddenException,
@@ -72,7 +73,7 @@ export class DecksCardsService {
                 document_title: createCardDto.document_title,
                 back_image_name: createCardDto.back_image_name,
                 front_image_name: createCardDto.front_image_name,
-                data: JSON.stringify(createCardDto.data),
+                data: JSON.stringify(this.spinSafe(createCardDto.data)),
                 order: lastDeckCard ? lastDeckCard.order + 1 : 1,
             },
             include: {
@@ -210,6 +211,12 @@ export class DecksCardsService {
         //         "You can't edit a deck that you don't own",
         //     ]);
 
+        const safeData = this.spinSafe(updateCardDto.data);
+        const before = await this.prismaService.card.findUnique({
+            where: { id },
+            select: { data: true },
+        });
+
         const card = await this.prismaService.card.update({
             where: {
                 id,
@@ -221,11 +228,26 @@ export class DecksCardsService {
                 document_title: updateCardDto.document_title,
                 back_image_name: updateCardDto.back_image_name,
                 front_image_name: updateCardDto.front_image_name,
-                data: JSON.stringify(updateCardDto.data),
+                data: JSON.stringify(safeData),
             },
         });
 
+        // photos removed from the 360° set are no longer used: delete their files
+        const kept = new Set(SpinFrameNames(safeData));
+        for (const name of SpinFrameNames(before?.data)) {
+            if (!kept.has(name)) await this.mediaService.delete(name);
+        }
+
         return card;
+    }
+
+    private spinSafe(data: object): object {
+        try {
+            return NormalizeSpin(data);
+        } catch (e) {
+            GenerateBadRequestException([e.message]);
+            throw e;
+        }
     }
 
     async delete(user: User | undefined, deckId: number, id: number) {
