@@ -10,6 +10,7 @@ import { FindQueryDto } from "src/dtos/find-query.dto";
 import { generateRandomCode } from "src/utils/code-generation.utils";
 import { Parser } from 'json2csv';
 import { GenerateBadRequestException } from "src/exception/bad-request.exception";
+import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 
 @Injectable()
 export class CodesService {
@@ -191,18 +192,21 @@ export class CodesService {
         ]);
     }
 
-    async linkDecksByCode(user: User, code: string) {
+    async linkDecksByCode(user: User, rawCode: string) {
+        const code = String(rawCode ?? "").trim();
         const codeEntity = await this.prismaService.code.findUnique({
             where: { code },
-            include: { decks: { include: { deck: true } } },
+            include: { decks: true },
         });
 
-	console.log("codeEntity");
-	console.table(codeEntity);
-
-     if (codeEntity==null) {
-                GenerateBadRequestException(["Code Does Not Exist"]);
-            }
+        if (codeEntity == null) {
+            // codes are deleted once used: a record of this user's use means they entered it before
+            const used = await this.prismaService.codeRedemption.findUnique({
+                where: { code_user_id: { code, user_id: user.id } },
+            });
+            if (used) GenerateBadRequestException(["لقد ادخلت الكود بالفعل"]);
+            GenerateBadRequestException(["Code Does Not Exist"]);
+        }
 
         const userDecks = await this.prismaService.userDeck.findMany({
             where: {
@@ -210,31 +214,35 @@ export class CodesService {
                 deck_id: { in: codeEntity.decks.map((deck) => deck.deck_id) },
             },
         });
-
-        const currentDecksIds = userDecks.map((ud) => ud.deck_id);
-
-	console.log("currentDecksIds");
-	console.table(currentDecksIds);
-
-        const decksIdsToBeAdded = codeEntity.decks
-            .filter((cd) => !currentDecksIds.includes(cd.deck_id))
+        const have = new Set(userDecks.map((ud) => ud.deck_id));
+        const toAdd = codeEntity.decks
+            .filter((cd) => !have.has(cd.deck_id))
             .map((cd) => cd.deck_id);
 
-	console.log("currentDecksIdsToBeAdded");
-	console.table(decksIdsToBeAdded);
-
-        if (decksIdsToBeAdded.length > 0) {
-	   console.log("adding new user decks");
-            const newUserDecks = await this.prismaService.userDeck.createMany({
-                data: decksIdsToBeAdded.map((id) => ({
+        // all-or-nothing: the decks, the "used" record and the code's removal go together
+        await this.prismaService.$transaction([
+            this.prismaService.userDeck.createMany({
+                data: toAdd.map((id) => ({
                     user_id: user.id,
                     deck_id: id,
                     editable: false,
                     sharable: false,
                 })),
-            });
-        }
+                skipDuplicates: true,
+            }),
+            this.prismaService.codeRedemption.upsert({
+                where: { code_user_id: { code, user_id: user.id } },
+                create: { code, user_id: user.id },
+                update: {},
+            }),
+            this.prismaService.codeDeck.deleteMany({
+                where: { code_id: codeEntity.id },
+            }),
+            this.prismaService.code.deleteMany({ where: { id: codeEntity.id } }),
+        ]);
 
-        await this.delete(codeEntity.id);
+        // The deck list is cached per user for 60s: without this the new subject
+        // did not show up until the cache expired (users had to leave and re-enter).
+        invalidateHierarchy(user.id);
     }
 }
