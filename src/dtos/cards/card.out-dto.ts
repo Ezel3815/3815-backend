@@ -1,12 +1,13 @@
 import { AnswerType, Card, CardAnswer } from "@prisma/client";
 import { GetFileUrl } from "src/utils/files.utils";
+import { WithSpinUrls } from "src/utils/spin.utils";
 
 export function CardOutDto(card: Card & { answers: CardAnswer[] }) {
     return {
         order: card.order,
         deck_id: card.deck_id,
         id: card.id,
-        data: card.data,
+        data: WithSpinUrls(card.data),
         front_image_url: card.front_image_name
             ? GetFileUrl(card.front_image_name)
             : null,
@@ -24,4 +25,3 @@ export function CardOutDto(card: Card & { answers: CardAnswer[] }) {
         answer_updated_at: card?.answers?.[0] ? card.answers[0].updated_at : new Date(0)
     };
 }
-
