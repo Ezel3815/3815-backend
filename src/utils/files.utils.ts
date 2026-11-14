@@ -92,3 +92,15 @@ export async function DeleteFile(name: string) {
         });
     }
 }
+
+// Inverse of GetFileUrl: turns a URL the API handed out back into the name stored in the
+// Media table (strips the Cloudinary resize segment, or the local /public/ prefix).
+export function ToStoredFileName(url: string): string {
+    if (typeof url !== "string") return url;
+    const seg = `/${CLOUDINARY_IMAGE_TRANSFORM}/`;
+    if (url.includes("res.cloudinary.com") && url.includes(seg))
+        return url.replace(seg, "/");
+    if (!url.startsWith("http")) return url;
+    const i = url.indexOf("/public/");
+    return i >= 0 ? url.slice(i + "/public/".length) : url;
+}
