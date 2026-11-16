@@ -144,7 +144,7 @@ export class PipelineService implements OnApplicationBootstrap {
             colorize: c.colorize !== false, mainColor: c.mainColor || "#009688", hiColor: c.hiColor || "#673ab7", hideNew: !!c.hideNew,
             threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
             polishWithFile: c.polishWithFile !== false, cutout: c.cutout !== false,
-            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back",
+            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65,
         };
         const job = await this.prisma.pipelineJob.create({
             data: { title: body.title || `${config.subject}`, user_id: user.id, config: config as any, state: { subjectId: null, doctors, createdAt: Date.now() } as any, log: [] },
@@ -334,7 +334,7 @@ export class PipelineService implements OnApplicationBootstrap {
             threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
             polishWithFile: true, cutout: c.cutout !== false,
             optQuality: c.optQuality !== false, optDups: c.optDups !== false, optImages: c.optImages !== false, pictureMode: mode,
-            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back",
+            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65,
         };
         const lectures: Lecture[] = ids.map((id): Lecture => ({
             id: `d${id}`, name: byId.get(id)!.title, fileName: "", size: 0, status: "queued", msg: "", progress: "", stage: "written",
