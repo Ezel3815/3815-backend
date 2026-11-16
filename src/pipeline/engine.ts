@@ -33,7 +33,10 @@ export interface Cfg {
     /** A card that already has a picture also gets the matching 3D model (default on). */
     replacePhotos?: boolean;
     /** Where the model appears: with the answer (default) or with the question. */
-    modelSide?: "front" | "back";
+        modelSide?: "front" | "back";
+    /** Confidence needed to assign a 3D model (default: lower than for pictures, so more cards get models). */
+    modelThreshold?: number;
+}
 }
 export interface IO {
     log(m: string): void; persist(): void;
