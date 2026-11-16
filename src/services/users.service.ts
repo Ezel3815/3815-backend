@@ -9,6 +9,8 @@ import { FindQueryDto } from "src/dtos/find-query.dto";
 import { CreateUserDto } from "src/dtos/users/create-user.dto";
 import { UpdateMeDto } from "src/dtos/users/update-me.dto";
 import { UpdatePasswordDto } from "src/dtos/users/update-password.dto";
+import { AdminSetPasswordDto } from "src/dtos/users/admin-set-password.dto";
+import { randomInt } from "crypto";
 import { UpdateUserDto } from "src/dtos/users/update-user.dto";
 import { UpdateProfileDto } from "src/dtos/users/update-profile.dto";
 import { UserOutDto, UserProfileOutDto } from "src/dtos/users/user.out-dto";
@@ -899,6 +901,29 @@ b{color:#4f9d69}.open{display:inline-block;background:#4f9d69;color:#fff;padding
         });
         if (!user) GenerateBadRequestException(["User does not exist"]);
         return UserOutDto(user);
+    }
+
+    /**
+     * Admin only: sets a new password for the account with this email (for a user who lost it).
+     * Returns the plain password ONCE so the admin can send it; only its hash is stored.
+     * Nothing else on the account (data, progress, status) is touched.
+     */
+    async adminSetPassword(dto: AdminSetPasswordDto) {
+        const email = dto.email.trim();
+        const user = await this.prismaService.user.findFirst({ where: { email } });
+        if (!user) GenerateBadRequestException(["No user with this email"]);
+
+        // no look-alike characters (0/O, 1/l/I) so it is easy to read out or type
+        const alphabet = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        const password =
+            dto.password ??
+            Array.from({ length: 10 }, () => alphabet[randomInt(alphabet.length)]).join("");
+
+        await this.prismaService.user.update({
+            where: { id: user.id },
+            data: { password: md5(password), reset_password_code: null },
+        });
+        return { id: user.id, email: user.email, name: user.name, password };
     }
 
     async updateMe(userId: number, updateMeDto: UpdateMeDto) {
