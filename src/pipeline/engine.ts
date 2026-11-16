@@ -37,7 +37,6 @@ export interface Cfg {
     /** Confidence needed to assign a 3D model (default: lower than for pictures, so more cards get models). */
     modelThreshold?: number;
 }
-}
 export interface IO {
     log(m: string): void; persist(): void;
     saveCard(deckId: number, q: string, a: string): Promise<number>;
