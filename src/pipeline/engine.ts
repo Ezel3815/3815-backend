@@ -659,8 +659,7 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
         rep.models = [];
         for (const m of this.models) {
             if (delIds.has(m.c.id)) continue;
-            if (m.conf < pth) { rep.lowConf.push({ kind: "3D model", ...brief(m.c), reason: `${m.name}: ${m.reason}`, conf: m.conf }); continue; }
-            try {
+            if (m.conf < (this.cfg.modelThreshold ?? pth)) { rep.lowConf.push({ kind: "3D model"
                 const data = JSON.parse(JSON.stringify(m.c.data));
                 data.model = { side: this.cfg.modelSide === "front" ? "front" : "back", url: m.file };
                 await this.io.updateCard(m.c.deckId, m.c.id, m.c.type, data);
