@@ -144,6 +144,8 @@ export class PipelineService implements OnApplicationBootstrap {
             colorize: c.colorize !== false, mainColor: c.mainColor || "#009688", hiColor: c.hiColor || "#673ab7", hideNew: !!c.hideNew,
             threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
             polishWithFile: c.polishWithFile !== false, cutout: c.cutout !== false,
+            // photos === false -> "3D models only": no web picture search at all, cards only get models from the library
+            optImages: c.photos !== false,
             use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65,
         };
         const job = await this.prisma.pipelineJob.create({
@@ -289,7 +291,9 @@ export class PipelineService implements OnApplicationBootstrap {
 
     /** "anatomy" (default) | "all" | "off"; older clients only sent use3d. */
     private mode3d(c: any): "anatomy" | "all" | "off" {
-        return (["anatomy", "all", "off"] as const).includes(c?.models3dMode) ? c.models3dMode : c?.use3d === false ? "off" : "anatomy";
+        const m = (["anatomy", "all", "off"] as const).includes(c?.models3dMode) ? c.models3dMode : c?.use3d === false ? "off" : "anatomy";
+        // "3D models only" (photos off) with models off would do nothing: fall back to the anatomy check
+        return c?.photos === false && m === "off" ? "anatomy" : m;
     }
 
     /** What the engine may do with the database: read / fix / delete cards and attach pictures. */
@@ -631,7 +635,7 @@ export class PipelineService implements OnApplicationBootstrap {
         const sum = (f: (l: Lecture) => number) => ls.reduce((n, { l }) => n + f(l), 0);
         return {
             title, subject: cfg.subject, finishedAt: new Date().toISOString(), startedAt: new Date(st.createdAt || Date.now()).toISOString(),
-            settings: { threshold: cfg.threshold, pictureThreshold: cfg.pictureThreshold ?? cfg.threshold, deleteThreshold: cfg.deleteThreshold, passes: cfg.passes, checkedAgainstFile: cfg.polishWithFile },
+            settings: { photos: cfg.optImages !== false, threshold: cfg.threshold, pictureThreshold: cfg.pictureThreshold ?? cfg.threshold, deleteThreshold: cfg.deleteThreshold, passes: cfg.passes, checkedAgainstFile: cfg.polishWithFile },
             totals: {
                 lectures: ls.length, lecturesDone: ls.filter(({ l }) => l.stage === "done").length, cards: sum((l) => l.saved.length || l.checked || 0),
                 fixed: sum((l) => l.rep?.fixes?.length ?? 0), deleted: sum((l) => l.rep?.deleted?.length ?? 0),
