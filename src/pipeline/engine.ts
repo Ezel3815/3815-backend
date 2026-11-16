@@ -283,7 +283,7 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
             try {
                 for (const m of await this.pickModels(d.title, cards, gone)) {
                     this.models.push(m);
-                    if (m.conf >= (this.cfg.pictureThreshold ?? this.cfg.threshold)) modelled.add(m.c.id);
+                    if (m.conf >= (this.cfg.modelThreshold ?? this.cfg.pictureThreshold ?? this.cfg.threshold)) modelled.add(m.c.id);
                 }
                 for (let i = needPics.length - 1; i >= 0; i--) if (modelled.has(needPics[i].c.id)) needPics.splice(i, 1);
                 this.say(`${d.title}: ${this.models.length} cards matched a 3D model`);
