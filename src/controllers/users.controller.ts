@@ -19,6 +19,7 @@ import { RegisterDto } from "src/dtos/auth/register.dto";
 import { CreateUserDto } from "src/dtos/users/create-user.dto";
 import { UpdateMeDto } from "src/dtos/users/update-me.dto";
 import { UpdatePasswordDto } from "src/dtos/users/update-password.dto";
+import { AdminSetPasswordDto } from "src/dtos/users/admin-set-password.dto";
 import { UpdateUserDto } from "src/dtos/users/update-user.dto";
 import { DeleteAllUsersDto } from "src/dtos/users/delete-all-users.dto";
 import { UpdateProfileDto } from "src/dtos/users/update-profile.dto";
@@ -258,6 +259,13 @@ export class UsersController {
     @Put("me")
     async updateMe(@DUser() user: User, @Body() updateMeDto: UpdateMeDto) {
         return await this.service.updateMe(user.id, updateMeDto);
+    }
+
+    // Admin only: a user lost their password. Sets a new one and returns it once.
+    @DRole()
+    @Post("admin/set-password")
+    async adminSetPassword(@Body() dto: AdminSetPasswordDto) {
+        return await this.service.adminSetPassword(dto);
     }
 
     @DRole()
