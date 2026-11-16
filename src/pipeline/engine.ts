@@ -26,6 +26,7 @@ export interface Cfg {
     optQuality?: boolean; optDups?: boolean; optImages?: boolean;
     /** smart = only what the reviewer flags; generous = also a second pass over every card without a picture; all = try a picture for every card without one */
     pictureMode?: "smart" | "generous" | "all";
+    /** Photo search is skipped when optImages === false (the "3D models only" option); 3D matching below still runs. */
     /** 3D models from the dashboard library: matched to cards BEFORE any picture search (default on). */
     use3d?: boolean;
     /** "anatomy" (default): only decks the AI recognises as human anatomy look at the library; "all": every deck; "off": never. */
@@ -277,6 +278,7 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
             this.say(`${d.title}: review done, ${needPics.length} cards want a picture`);
         }
 
+        if (!this.optImages) this.say(`${d.title}: photos are off, only 3D models from the library are assigned`);
         // 2a) 3D models from the library: a matching model is used INSTEAD of searching for a picture
         const modelled = new Set<number>();
         if (this.cfg.use3d !== false && this.cfg.models3dMode !== "off" && await this.wants3d(d.title, cards)) {
