@@ -33,7 +33,7 @@ export interface Cfg {
     /** A card that already has a picture also gets the matching 3D model (default on). */
     replacePhotos?: boolean;
     /** Where the model appears: with the answer (default) or with the question. */
-        modelSide?: "front" | "back";
+    modelSide?: "front" | "back";
     /** Confidence needed to assign a 3D model (default: lower than for pictures, so more cards get models). */
     modelThreshold?: number;
 }
@@ -659,7 +659,8 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
         rep.models = [];
         for (const m of this.models) {
             if (delIds.has(m.c.id)) continue;
-            if (m.conf < (this.cfg.modelThreshold ?? pth)) { rep.lowConf.push({ kind: "3D model"
+            if (m.conf < (this.cfg.modelThreshold ?? pth)) { rep.lowConf.push({ kind: "3D model", ...brief(m.c), reason: `${m.name}: ${m.reason}`, conf: m.conf }); continue; }
+            try {
                 const data = JSON.parse(JSON.stringify(m.c.data));
                 data.model = { side: this.cfg.modelSide === "front" ? "front" : "back", url: m.file };
                 await this.io.updateCard(m.c.deckId, m.c.id, m.c.type, data);
