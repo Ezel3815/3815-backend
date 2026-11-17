@@ -37,6 +37,8 @@ export interface Cfg {
     modelSide?: "front" | "back";
     /** Confidence needed to assign a 3D model (default: lower than for pictures, so more cards get models). */
     modelThreshold?: number;
+    /** How many lectures the server works on at the same time (1-3, default 2). */
+    parallel?: number;
 }
 export interface IO {
     log(m: string): void; persist(): void;
@@ -84,7 +86,7 @@ export class Engine {
     }
     lastChecked = 0;
     /** How many AI jobs run side by side: one per working key (max 4), so keys are not hammered. */
-    private conc(withFile = false) { return Math.max(1, Math.min(withFile ? 2 : 4, this.pool.keys.filter((k) => !k.dead).length)); }
+    private conc(withFile = false) { return Math.max(1, Math.min(4, this.pool.keys.filter((k) => !k.dead).length)); }
     private async pmap<T>(items: T[], n: number, fn: (x: T) => Promise<void>) {
         let i = 0;
         await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) { this.chk(); await fn(items[i++]); } }));
@@ -252,10 +254,11 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
         const needPics: { c: PCard; idea: string; terms: string[]; conf: number }[] = [];
         if (this.optQuality || this.optImages) {
             const live = cards.filter((c) => !gone.has(c.id));
-            const starts: number[] = []; for (let s = 0; s < live.length; s += 20) starts.push(s);
+            const B = src ? 30 : 20; // the lecture file is re-sent with every call: fewer, bigger batches when it is attached
+            const starts: number[] = []; for (let s = 0; s < live.length; s += B) starts.push(s);
             await this.pmap(starts, this.conc(!!src), async (s) => {
-                this.progress = `${d.title}: reviewing cards ${s + 1}-${Math.min(s + 20, live.length)} of ${live.length}`;
-                const part = live.slice(s, s + 20);
+                this.progress = `${d.title}: reviewing cards ${s + 1}-${Math.min(s + B, live.length)} of ${live.length}`;
+                const part = live.slice(s, s + B);
                 const { data } = await this.ai(this.reviewPrompt(d.title, part, !!src), {
                     type: "ARRAY", items: { type: "OBJECT", properties: {
                         id: { type: "INTEGER" }, verdict: { type: "STRING" }, confidence: { type: "NUMBER" }, reason: { type: "STRING" },
@@ -361,7 +364,8 @@ Return ONLY JSON: {"anatomy": true, "confidence": 90}`,
         const catalog = lib.map((m) => `${m.id}: ${m.name}${m.aliases ? " | " + m.aliases : ""}${m.category ? " [" + m.category + "]" : ""}`).join("\n");
         const todo = cards.filter((c) => !gone.has(c.id) && !c.data?.model?.url && (c.noPic || this.cfg.replacePhotos !== false));
         const out: Mdl[] = [];
-        for (let s = 0; s < todo.length; s += 30) {
+        const starts: number[] = []; for (let s = 0; s < todo.length; s += 30) starts.push(s);
+        await this.pmap(starts, this.conc(), async (s) => { // batches are independent: run several at once
             const part = todo.slice(s, s + 30);
             this.progress = `${title}: 3D models ${s + 1}-${Math.min(s + 30, todo.length)} of ${todo.length}`;
             const { data } = await this.ai(`You match flashcards of the lecture "${title}" to a LIBRARY of ready 3D anatomy models.
@@ -382,7 +386,7 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q), a: plain(c.a) })))}
                 if (!c || !m) continue;
                 out.push({ c, modelId: m.id, name: m.name, file: m.file, conf: clamp(o?.confidence), reason: String(o?.reason ?? "") });
             }
-        }
+        });
         return out;
     }
 
