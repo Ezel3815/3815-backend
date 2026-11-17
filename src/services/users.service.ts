@@ -31,7 +31,7 @@ import {
     sendPushToUser,
 } from "src/utils/push.utils";
 import { v7 as uuid } from "uuid";
-import * as md5 from "md5";
+import { md5 } from "src/utils/md5";
 import { MosaicService } from "../mosaic/mosaic.service";
 import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 
