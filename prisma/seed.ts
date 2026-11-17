@@ -7,7 +7,7 @@ import {
     UserStatus,
 } from "@prisma/client";
 import { Prisma } from "@prisma/client";
-import * as uuid from "md5";
+import { md5 as uuid } from "../src/utils/md5";
 
 const prisma = new PrismaClient();
 
