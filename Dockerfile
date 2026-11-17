@@ -29,4 +29,11 @@ RUN npm run build && ls dist
 # reason is in the logs.
 # The compiled entry is dist/src/main.js (prisma/ is compiled too); fall back
 # to dist/main.js if the layout ever changes.
+
+# Memory: the free host has 512 MB in total. Without an explicit limit Node lets its heap grow until the host kills the whole
+# container ("out of memory"). A fixed heap limit makes Node collect garbage earlier instead. It is set here, AFTER the build step,
+# so it only applies to the running server. To change it without redeploying code, set NODE_OPTIONS in the host's env vars
+# (about 55% of the host's RAM is a good value). AI_INFLIGHT_MB / MEM_SOFT_MB (see src/pipeline/gemini-json.ts) tune the pipeline.
+ENV NODE_OPTIONS="--max-old-space-size=280"
+
 ENTRYPOINT ["sh", "-c", "npx prisma db push --skip-generate || echo 'WARNING: prisma db push failed - starting anyway'; if [ -f dist/src/main.js ]; then exec node dist/src/main.js; else exec node dist/main.js; fi"]
