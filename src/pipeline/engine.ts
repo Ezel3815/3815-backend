@@ -33,6 +33,8 @@ export interface Lecture {
     drafts: Draft[]; saved: { q: string; a: string }[]; rejected: string[];
     deckId: number | null; extracted: boolean; rep: LRep;
     checked?: number; // polish jobs: how many cards of this deck were looked at
+    /** How long the lecture really took (ms) and what the estimate had predicted (s): used to calibrate the time estimate. */
+    t?: { ms: number; pred: number };
 }
 export interface Doctor { id: string; name: string; deckId: number | null; lectures: Lecture[]; styleText?: string; styleFile?: boolean; styleGuide?: string }
 interface Missed { location: string; topic: string; detail: string }
@@ -99,6 +101,7 @@ export class Engine {
         if (cfg.optImages != null) this.optImages = !!cfg.optImages;
     }
     lastChecked = 0;
+    lastNoPic = 0;
     /** How many AI jobs run side by side: one per working key (max 4), so keys are not hammered. */
     private conc(withFile = false) { return Math.max(1, Math.min(withFile ? 2 : 4, this.pool.keys.filter((k) => !k.dead).length)); }
     private async pmap<T>(items: T[], n: number, fn: (x: T) => Promise<void>) {
@@ -224,7 +227,7 @@ Return ONLY a JSON array: [ { "question": "...", "answer": "..." } ]`,
     private async analyzeDeck(d: { id: number; title: string }, src: { base64: string; mime: string } | null) {
         const { cards, skipped } = await this.loadCards(d.id, d.title);
         this.say(`${d.title}: ${cards.length} cards${skipped ? ` (${skipped} special cards skipped)` : ""}`);
-        this.lastChecked = cards.length;
+        this.lastChecked = cards.length; this.lastNoPic = cards.filter((c) => c.noPic).length;
         if (!cards.length) return;
         const byId = new Map(cards.map((c) => [c.id, c]));
         const gone = new Set<number>(); // cards already marked for deletion
