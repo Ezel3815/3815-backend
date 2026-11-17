@@ -8,6 +8,7 @@ import { EmailService } from "src/services/email.service";
 import { McqService } from "src/mcq/mcq.service";
 import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 import { Cfg, Doctor, Engine, IO, Lecture } from "./engine";
+import { EstCfg, EstLecture, Estimate, calibration, estimate as buildEstimate, lectureParts } from "./estimate";
 import { KeyPool, PoolExhausted, PoolStopped, Role, keyLabel } from "./key-pool";
 import { McqCfg, McqEngine, slugId } from "./mcq-engine";
 import { memLine } from "./mem-gate";
@@ -221,6 +222,7 @@ export class PipelineService implements OnApplicationBootstrap {
             kind, runAt,
             lectures: ls.map((l) => ({ id: l.id, name: l.name, status: l.status, stage: l.stage, msg: l.msg, progress: l.progress, cards: l.saved.length || l.checked || 0 })),
             done: ls.filter((l) => l.stage === "done").length, total: ls.length, cards: ls.reduce((n, l) => n + (l.saved.length || l.checked || 0), 0),
+            estimate: state?.estimate ?? null,
         };
     }
 
@@ -234,14 +236,95 @@ export class PipelineService implements OnApplicationBootstrap {
         const st: any = j.state;
         if (runAt && runAt > Date.now() + 30_000) {
             st.runAt = runAt;
+            const est = await this.estimateJob(id, j.config as any, st).catch(() => null);
+            if (est) st.estimate = { ...est, perLecture: undefined, at: Date.now() }; // the per-lecture list stays out of the job row: the job list is polled every 6 s
             await this.prisma.pipelineJob.update({ where: { id }, data: { status: "scheduled", message: `Scheduled for ${new Date(runAt).toISOString()}`, state: st } });
-            return { ok: true, scheduled: true };
+            return { ok: true, scheduled: true, estimate: est };
         }
         delete st.runAt; delete st.crashes;
         for (const l of (st.doctors as Doctor[]).flatMap((d) => d.lectures)) if (l.status === "error") { l.status = l.stage === "written" ? "written" : "queued"; l.msg = ""; }
+        const est = await this.estimateJob(id, j.config as any, st).catch(() => null);
+        if (est) st.estimate = { ...est, perLecture: undefined, at: Date.now() }; // the per-lecture list stays out of the job row: the job list is polled every 6 s
         await this.prisma.pipelineJob.update({ where: { id }, data: { status: "queued", message: null, state: st } });
         this.kick();
-        return { ok: true };
+        return { ok: true, estimate: est };
+    }
+
+    // ---------------- time estimate ----------------
+    private liveKeys() { return this.pool.keys.filter((k) => !k.dead).length; }
+    private estCfg(c: any): EstCfg {
+        const pm = (["smart", "generous", "all"] as const).includes(c?.pictureMode) ? c.pictureMode : undefined;
+        return {
+            cardCount: c?.cardCount ? Math.floor(Number(c.cardCount)) : null, passes: Math.max(0, Math.min(2, Number(c?.passes ?? 1))),
+            polishWithFile: c?.polishWithFile !== false, optQuality: c?.optQuality !== false, optDups: c?.optDups !== false,
+            optImages: c?.photos === false ? false : c?.optImages !== false, pictureMode: pm, models3dMode: this.mode3d(c),
+            parallel: Math.max(1, Math.min(3, Math.floor(Number(c?.parallel)) || 2)),
+        };
+    }
+    /** Correction factor learned from lectures that already finished on this server (cached for 5 minutes). */
+    private calCache: { t: number; v: ReturnType<typeof calibration> } | null = null;
+    private async getCalibration() {
+        if (this.calCache && Date.now() - this.calCache.t < 5 * 60_000) return this.calCache.v;
+        let v: ReturnType<typeof calibration> = null;
+        try {
+            const rows = await this.prisma.pipelineJob.findMany({ where: { status: "done" }, orderBy: { id: "desc" }, take: 12, select: { state: true } });
+            const samples = rows.flatMap((r) => ((r.state as any)?.doctors ?? []).flatMap((d: Doctor) => d.lectures.map((l) => l.t).filter((t): t is { ms: number; pred: number } => !!t)));
+            v = calibration(samples);
+        } catch {}
+        this.calCache = { t: Date.now(), v };
+        return v;
+    }
+    /** { cards, cards without a picture } per deck, counted the same way the engine does (BASIC / CLOZE only). */
+    private async polishCounts(deckIds: number[]) {
+        const where = { deck_id: { in: deckIds }, type: { in: [CardType.BASIC, CardType.CLOZE] } };
+        const [all, bare] = await Promise.all([
+            this.prisma.card.groupBy({ by: ["deck_id"], where, _count: { _all: true } }),
+            this.prisma.card.groupBy({ by: ["deck_id"], where: { ...where, front_image_name: null, back_image_name: null }, _count: { _all: true } }),
+        ]);
+        const m = new Map<number, { cards: number; noPic: number }>(deckIds.map((i) => [i, { cards: 0, noPic: 0 }]));
+        for (const r of all) m.get(r.deck_id)!.cards = r._count._all;
+        for (const r of bare) m.get(r.deck_id)!.noPic = r._count._all;
+        return m;
+    }
+    /** Estimate for a job that already exists: only the lectures that are not finished (so "Resume" shows what is left). */
+    private async estimateJob(id: number, cfg: any, st: any): Promise<Estimate | null> {
+        if (st?.kind === "mcq") return null;
+        const doctors: Doctor[] = st.doctors ?? [];
+        const withFile = new Set((await this.prisma.pipelineFile.findMany({ where: { job_id: id }, select: { lecture_id: true }, distinct: ["lecture_id"] })).map((f) => f.lecture_id));
+        const todo = doctors.flatMap((d) => d.lectures.filter((l) => l.stage !== "done").map((l) => ({ d, l })));
+        let lectures: EstLecture[];
+        if (st.kind === "polish") {
+            const counts = await this.polishCounts(todo.map((x) => x.l.deckId!).filter((x) => x != null));
+            lectures = todo.map(({ l }) => ({ name: l.name, kind: "polish", cards: counts.get(l.deckId!)?.cards, noPic: counts.get(l.deckId!)?.noPic, hasFile: withFile.has(l.id) }));
+        } else lectures = todo.map(({ l }) => l.stage === "written"
+            ? { name: l.name, kind: "polish", cards: l.saved.length, noPic: l.saved.length, hasFile: cfg?.polishWithFile !== false }
+            : { name: l.name, kind: "create", sizeMB: (l.size || 0) / 1048576 });
+        const style = new Set(todo.filter((x) => (x.d.styleText?.trim() || x.d.styleFile) && !x.d.styleGuide).map((x) => x.d.id)).size;
+        return buildEstimate({ kind: st.kind === "polish" ? "polish" : "create", cfg: this.estCfg(cfg), lectures, keys: this.liveKeys(), styleDoctors: style, calibration: await this.getCalibration() });
+    }
+    /** Called by the dashboard BEFORE a job exists, whenever the form changes.
+     *  body: { kind: "create", config, doctors: [{ styleText?, styleFile?, lectures: [{ name, size }] }] }  or  { kind: "polish", config, deckIds, hasFile? } */
+    async estimate(body: any): Promise<Estimate> {
+        const cfg = this.estCfg(body?.config ?? {});
+        const cal = await this.getCalibration();
+        if (body?.kind === "polish") {
+            const ids: number[] = [...new Set<number>((Array.isArray(body.deckIds) ? body.deckIds : []).map(Number).filter((x: number) => Number.isInteger(x) && x > 0))].slice(0, 500);
+            const [decks, counts] = await Promise.all([this.prisma.deck.findMany({ where: { id: { in: ids } }, select: { id: true, title: true } }), this.polishCounts(ids)]);
+            const title = new Map(decks.map((d) => [d.id, d.title]));
+            const lectures: EstLecture[] = ids.filter((i) => title.has(i)).map((i) => ({ name: title.get(i)!, kind: "polish", cards: counts.get(i)!.cards, noPic: counts.get(i)!.noPic, hasFile: !!body.hasFile && ids.length === 1 }));
+            return buildEstimate({ kind: "polish", cfg, lectures, keys: this.liveKeys(), calibration: cal });
+        }
+        const docs: any[] = Array.isArray(body?.doctors) ? body.doctors : [];
+        const lectures: EstLecture[] = docs.flatMap((d) => (Array.isArray(d.lectures) ? d.lectures : []).map((l: any): EstLecture => ({ name: String(l.name || ""), kind: "create", sizeMB: (Number(l.size) || 0) / 1048576 })));
+        const style = docs.filter((d) => String(d.styleText || "").trim() || d.styleFile).length;
+        return buildEstimate({ kind: "create", cfg, lectures, keys: this.liveKeys(), styleDoctors: style, calibration: cal });
+    }
+    /** Remembers how long a finished lecture really took next to what the estimate said, so the next estimates get closer. */
+    private noteTiming(l: Lecture, t0: number, spec: EstLecture, cfg: any) {
+        try {
+            const pred = lectureParts(spec, this.estCfg(cfg), this.liveKeys()).parts.reduce((a, p) => a + p.seconds, 0);
+            if (pred > 0) l.t = { ms: Date.now() - t0, pred: Math.round(pred) };
+        } catch {}
     }
 
     async pause(id: number) {
@@ -416,7 +499,9 @@ export class PipelineService implements OnApplicationBootstrap {
                     const exists = await this.prisma.deck.findUnique({ where: { id: l.deckId! }, select: { id: true } });
                     if (!exists) { l.status = "error"; l.msg = "This deck was deleted."; return; }
                     const src = await this.loadFile(id, l.id); // optional lecture file: lets the reviewer check facts against it
-                    await new Engine(this.pool, cfg, io).polishExisting(l, src);
+                    const t0 = Date.now(), eng = new Engine(this.pool, cfg, io);
+                    await eng.polishExisting(l, src);
+                    this.noteTiming(l, t0, { name: l.name, kind: "polish", cards: eng.lastChecked, noPic: eng.lastNoPic, hasFile: !!src }, cfg);
                     await this.prisma.pipelineFile.deleteMany({ where: { job_id: id, lecture_id: l.id } });
                 } catch (e: any) {
                     if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e;
@@ -501,7 +586,9 @@ export class PipelineService implements OnApplicationBootstrap {
                 if (!src) { l.status = "error"; l.msg = "The file was not uploaded."; return; }
                 try {
                     const eng = new Engine(this.pool, cfg, io); eng.setStyle(d.styleGuide || "");
+                    const t0 = Date.now(), fresh = l.stage === "queued"; // a resumed lecture only did part of the work: not a fair sample
                     await eng.processLecture(d, l, src);
+                    if (fresh) this.noteTiming(l, t0, { name: l.name, kind: "create", sizeMB: (l.size || 0) / 1048576 }, cfg);
                     await this.prisma.pipelineFile.deleteMany({ where: { job_id: id, lecture_id: l.id } }); // free database space
                 } catch (e: any) {
                     if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e;
