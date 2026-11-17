@@ -146,17 +146,18 @@ export async function geminiFetch(apiKey: string, model: string, body: any, fast
     const models = [model, ...GEMINI_FALLBACKS.filter((m) => m !== model)];
     let last: Response | undefined;
     let netErr = "";
+    // the body can hold a whole PDF as base64: serialise it once, not once per model tried
+    const cache: Record<string, string> = {};
+    const bodyFor = (think: boolean) => (cache[think ? "t" : "p"] ??= JSON.stringify(think ? { ...body, generationConfig: { ...body.generationConfig, thinkingConfig: { thinkingLevel: "low" } } } : body));
     for (let round = 0; round < (fast ? 1 : 3); round++) {
         for (const m of models) {
             // 3.x models "think" by default, which makes them very slow: turn it off
-            const b = m.startsWith("gemini-3")
-                ? { ...body, generationConfig: { ...body.generationConfig, thinkingConfig: { thinkingLevel: "low" } } }
-                : body;
+            const payload = bodyFor(m.startsWith("gemini-3"));
             try {
                 last = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${apiKey}`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(b),
+                    body: payload,
                 });
             } catch (e: any) {
                 // browser-level network failure ("Load failed"): try the next model
