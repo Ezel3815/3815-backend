@@ -116,7 +116,7 @@ export class PipelineService implements OnApplicationBootstrap {
             })),
         }));
         const c = body.config;
-        const config: Cfg = {
+        const config = {
             subject: String(c.subject || "").trim(), yearId: Number(c.yearId), instructions: String(c.instructions || ""),
             cardCount: c.cardCount ? Math.floor(Number(c.cardCount)) : null, passes: Math.max(0, Math.min(2, Number(c.passes ?? 1))),
             colorize: c.colorize !== false, mainColor: c.mainColor || "#009688", hiColor: c.hiColor || "#673ab7", hideNew: !!c.hideNew,
@@ -125,7 +125,7 @@ export class PipelineService implements OnApplicationBootstrap {
             // photos === false -> "3D models only": no web picture search at all, cards only get models from the library
             optImages: (c as any).photos !== false, parallel: Math.max(1, Math.min(3, Math.floor(Number((c as any).parallel)) || 2)),
             use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65,
-        };
+        } as Cfg;
         const job = await this.prisma.pipelineJob.create({
             data: { title: body.title || `${config.subject}`, user_id: user.id, config: config as any, state: { subjectId: null, doctors, createdAt: Date.now() } as any, log: [] },
         });
@@ -333,13 +333,13 @@ export class PipelineService implements OnApplicationBootstrap {
         const c = body?.config ?? {};
         const mode = (["smart", "generous", "all"] as const).includes(c.pictureMode) ? c.pictureMode : "generous";
         const title = String(body?.title || "").trim().slice(0, 120) || `Polish · ${ids.length} lecture${ids.length === 1 ? "" : "s"}`;
-        const config: Cfg = {
+        const config = {
             subject: title, yearId: 0, instructions: "", cardCount: null, passes: 0, colorize: true, mainColor: "#009688", hiColor: "#673ab7", hideNew: false,
             threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
             polishWithFile: true, cutout: c.cutout !== false,
             optQuality: c.optQuality !== false, optDups: c.optDups !== false, optImages: c.optImages !== false, pictureMode: mode, parallel: Math.max(1, Math.min(3, Math.floor(Number(c.parallel)) || 2)),
             use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65,
-        };
+        } as Cfg;
         const lectures: Lecture[] = ids.map((id): Lecture => ({
             id: `d${id}`, name: byId.get(id)!.title, fileName: "", size: 0, status: "queued", msg: "", progress: "", stage: "written",
             drafts: [], saved: [], rejected: [], deckId: id, extracted: true, rep: emptyRep(),
