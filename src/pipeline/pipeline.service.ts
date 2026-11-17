@@ -123,7 +123,7 @@ export class PipelineService implements OnApplicationBootstrap {
             threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
             polishWithFile: c.polishWithFile !== false, cutout: c.cutout !== false,
             // photos === false -> "3D models only": no web picture search at all, cards only get models from the library
-            optImages: (c as any).photos !== false,
+            optImages: (c as any).photos !== false, parallel: Math.max(1, Math.min(3, Math.floor(Number((c as any).parallel)) || 2)),
             use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65,
         };
         const job = await this.prisma.pipelineJob.create({
@@ -242,6 +242,28 @@ export class PipelineService implements OnApplicationBootstrap {
         }, 20 * 60 * 1000);
     }
 
+    /** How many lectures run side by side: the "parallel" setting (default 2), but never more than the working AI keys, so keys are not hammered. */
+    private lanes(cfg: any, tasks: number) {
+        const keys = this.pool.keys.filter((k) => !k.dead).length;
+        return Math.max(1, Math.min(Math.floor(Number(cfg?.parallel)) || 2, 3, keys, tasks));
+    }
+    /** Runs the lectures `n` at a time. A pause / empty keys stops every lane, and the first such stop is thrown once all lanes have ended. */
+    private async runLectures<T>(tasks: T[], n: number, work: (t: T) => Promise<void>) {
+        let next = 0, stop: any = null;
+        await Promise.all(Array.from({ length: n }, async () => {
+            while (!stop) {
+                if (this.pool.stopped) { stop ??= new PoolStopped("Paused"); break; }
+                const t = tasks[next++]; if (t === undefined) break;
+                try { await work(t); }
+                catch (e: any) {
+                    if (e instanceof PoolStopped || e instanceof PoolExhausted) { stop ??= e; this.pool.stopped = true; break; }
+                    throw e;
+                }
+            }
+        }));
+        if (stop) throw stop;
+    }
+
     private async ensureDeck(user: User, title: string, type: "PACKAGE_DECK" | "CARDS_DECK", parentId: number, order: number, visible: boolean): Promise<number> {
         const t = title.trim();
         const where = { parent_id: parentId, by_admin: true, title: t } as any;
@@ -315,7 +337,7 @@ export class PipelineService implements OnApplicationBootstrap {
             subject: title, yearId: 0, instructions: "", cardCount: null, passes: 0, colorize: true, mainColor: "#009688", hiColor: "#673ab7", hideNew: false,
             threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
             polishWithFile: true, cutout: c.cutout !== false,
-            optQuality: c.optQuality !== false, optDups: c.optDups !== false, optImages: c.optImages !== false, pictureMode: mode,
+            optQuality: c.optQuality !== false, optDups: c.optDups !== false, optImages: c.optImages !== false, pictureMode: mode, parallel: Math.max(1, Math.min(3, Math.floor(Number(c.parallel)) || 2)),
             use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65,
         };
         const lectures: Lecture[] = ids.map((id): Lecture => ({
@@ -346,22 +368,22 @@ export class PipelineService implements OnApplicationBootstrap {
         await this.prisma.pipelineJob.update({ where: { id }, data: { status: "running", message: null } });
         try {
             if (!this.pool.keys.some((k) => !k.dead)) throw new Error("No AI key on the server. Add keys in Pipeline > AI keys.");
-            const engine = new Engine(this.pool, cfg, io);
-            for (const d of doctors) for (const l of d.lectures) {
-                if (l.stage === "done" || l.deckId == null) continue;
-                if (this.pool.stopped) throw new PoolStopped("Paused");
+            const tasks = lectures.filter((l) => l.stage !== "done" && l.deckId != null);
+            const lanes = this.lanes(cfg, tasks.length);
+            if (lanes > 1) io.log(`Working on ${lanes} lectures at the same time`);
+            await this.runLectures(tasks, lanes, async (l) => {
                 try {
-                    const exists = await this.prisma.deck.findUnique({ where: { id: l.deckId }, select: { id: true } });
-                    if (!exists) { l.status = "error"; l.msg = "This deck was deleted."; continue; }
+                    const exists = await this.prisma.deck.findUnique({ where: { id: l.deckId! }, select: { id: true } });
+                    if (!exists) { l.status = "error"; l.msg = "This deck was deleted."; return; }
                     const src = await this.loadFile(id, l.id); // optional lecture file: lets the reviewer check facts against it
-                    await engine.polishExisting(l, src);
+                    await new Engine(this.pool, cfg, io).polishExisting(l, src);
                     await this.prisma.pipelineFile.deleteMany({ where: { job_id: id, lecture_id: l.id } });
                 } catch (e: any) {
                     if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e;
                     l.status = "error"; l.msg = String(e?.message || e); io.log(`${l.name}: ${l.msg}`);
                 }
                 persist();
-            }
+            });
             const failed = lectures.some((l) => l.stage !== "done");
             clearTimeout(timer);
             const doneMsg = failed ? "Finished with some lectures failed: see the report, then press Resume." : "Finished.";
@@ -429,22 +451,24 @@ export class PipelineService implements OnApplicationBootstrap {
                         io.log(`Dr ${d.name}: could not learn the style (${String(e?.message || e)}). Continuing without it.`);
                     }
                 }
-                engine.setStyle(d.styleGuide || "");
-                for (const l of d.lectures) {
-                if (l.stage === "done" || l.deckId == null) continue;
-                if (this.pool.stopped) throw new PoolStopped("Paused");
+            }
+            // lectures run side by side (each with its own engine: an engine keeps the state of ONE lecture)
+            const tasks = doctors.flatMap((d) => d.lectures.filter((l) => l.stage !== "done" && l.deckId != null).map((l) => ({ d, l })));
+            const lanes = this.lanes(cfg, tasks.length);
+            if (lanes > 1) io.log(`Working on ${lanes} lectures at the same time`);
+            await this.runLectures(tasks, lanes, async ({ d, l }) => {
                 const src = await this.loadFile(id, l.id);
-                if (!src) { l.status = "error"; l.msg = "The file was not uploaded."; continue; }
+                if (!src) { l.status = "error"; l.msg = "The file was not uploaded."; return; }
                 try {
-                    await engine.processLecture(d, l, src);
+                    const eng = new Engine(this.pool, cfg, io); eng.setStyle(d.styleGuide || "");
+                    await eng.processLecture(d, l, src);
                     await this.prisma.pipelineFile.deleteMany({ where: { job_id: id, lecture_id: l.id } }); // free database space
                 } catch (e: any) {
                     if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e;
                     l.status = "error"; l.msg = String(e?.message || e); io.log(`${l.name}: ${l.msg}`);
                 }
                 persist();
-                }
-            }
+            });
             if (cfg.hideNew && doctors.every((d) => d.lectures.every((l) => l.stage === "done"))) {
                 const ids = [st.subjectId, ...doctors.flatMap((d) => [d.deckId, ...d.lectures.map((l) => l.deckId)])].filter((x) => x != null);
                 await this.prisma.deck.updateMany({ where: { id: { in: ids } }, data: { visible: true } }); invalidateHierarchy();
