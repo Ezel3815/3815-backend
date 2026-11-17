@@ -1,628 +1,81 @@
-import { BadRequestException, Injectable, Logger, NotFoundException, OnApplicationBootstrap } from "@nestjs/common";
-import { CardType, MediaType, User } from "@prisma/client";
+import { Injectable } from "@nestjs/common";
 import { PrismaService } from "nestjs-prisma";
-import { DecksService } from "src/services/decks.service";
-import { DecksCardsService } from "src/services/decks-cards.service";
-import { MediaService } from "src/services/media.service";
-import { EmailService } from "src/services/email.service";
-import { McqService } from "src/mcq/mcq.service";
-import { invalidateHierarchy } from "src/utils/hierarchy-cache";
-import { Cfg, Doctor, Engine, IO, Lecture } from "./engine";
-import { KeyPool, PoolExhausted, PoolStopped, Role, keyLabel } from "./key-pool";
-import { McqCfg, McqEngine, slugId } from "./mcq-engine";
+import { randomBytes } from "crypto";
+import { GenerateBadRequestException } from "src/exception/bad-request.exception";
+import { AiService } from "./ai.service";
 
-const MAX_TITLE = 60; // longest deck name allowed (same limit as the deck DTOs)
-const CHUNK = 4 * 1024 * 1024;
-/** Looks at the first bytes to find out what the file REALLY is (the name and browser type can be wrong). */
-function sniff(buf: Buffer): string | null {
-    if (buf.subarray(0, 1024).includes("%PDF-")) return "application/pdf";
-    if (buf[0] === 0x89 && buf.subarray(1, 4).toString("latin1") === "PNG") return "image/png";
-    if (buf[0] === 0xff && buf[1] === 0xd8) return "image/jpeg";
-    if (buf.subarray(0, 4).toString("latin1") === "RIFF" && buf.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
-    return null;
-}
-const uid = () => Math.random().toString(36).slice(2, 9);
-const emptyRep = () => ({ fixes: [], deleted: [], pictures: [], noPicture: [], lowConf: [] });
+// Prices / payment destination come from env so you can change them without a deploy of code.
+const PRICE = { MONTHLY: Number(process.env.AI_PRICE_MONTHLY_USD ?? 5.99), YEARLY: Number(process.env.AI_PRICE_YEARLY_USD ?? 49.99) };
 
 @Injectable()
-export class PipelineService implements OnApplicationBootstrap {
-    private readonly logger = new Logger("Pipeline");
-    private pool = KeyPool.fromEnv();
-    private busy = false;
-    private waitMailed = new Set<number>();
-    private currentId: number | null = null;
-    private retry?: NodeJS.Timeout;
+export class PaymentsService {
+    constructor(private prisma: PrismaService, private ai: AiService) {}
 
-    constructor(
-        private prisma: PrismaService,
-        private decks: DecksService,
-        private cards: DecksCardsService,
-        private media: MediaService,
-        private email: EmailService,
-        private mcq: McqService,
-    ) {}
-
-    // After a restart/redeploy of the free server, unfinished jobs continue by themselves.
-    onApplicationBootstrap() {
-        this.loadKeys();
-        // scheduled jobs: checked every minute (they are stored in the database, so a restart does not lose them)
-        setInterval(async () => {
-            try {
-                const due = (await this.prisma.pipelineJob.findMany({ where: { status: "scheduled" }, select: { id: true, state: true } })).filter((j) => ((j.state as any)?.runAt ?? 0) <= Date.now());
-                if (!due.length) return;
-                await this.prisma.pipelineJob.updateMany({ where: { id: { in: due.map((j) => j.id) } }, data: { status: "queued", message: null } });
-                this.kick();
-            } catch {}
-        }, 60_000);
-        setTimeout(async () => {
-            await this.prisma.pipelineJob.updateMany({ where: { status: "waiting" }, data: { status: "queued" } }).catch(() => {});
-            // A job that is still "running" at boot means the server died while running it (usually out of memory).
-            // Count it: after 3 crashes in a row the job is paused instead of crashing the server again and again.
-            try {
-                for (const j of await this.prisma.pipelineJob.findMany({ where: { status: "running" }, select: { id: true, state: true } })) {
-                    const st: any = j.state ?? {};
-                    st.crashes = (Number(st.crashes) || 0) + 1;
-                    const stop = st.crashes >= 3;
-                    await this.prisma.pipelineJob.update({ where: { id: j.id }, data: { status: stop ? "paused" : "queued", state: st, message: stop ? "The server crashed 3 times while running this job (almost always: out of memory). Raise the server memory limit (NODE_OPTIONS=--max-old-space-size), then press Resume." : null } });
-                }
-            } catch {}
-            this.kick();
-        }, 20000);
-    }
-
-    private dbIds = new Map<string, number>();
-    private async loadKeys() {
-        try {
-            for (const r of await this.prisma.pipelineKey.findMany()) { this.pool.addKeys(r.key, r.role as Role); this.dbIds.set(r.key, r.id); }
-        } catch (e: any) { this.logger.error("keys: " + String(e?.message || e)); }
-    }
-    keys() {
-        return this.pool.keys.map((k) => ({ id: this.dbIds.get(k.key) ?? null, label: keyLabel(k.key), role: k.role, state: this.pool.state(k), reason: k.reason, ok: k.ok }));
-    }
-    /** Keys added from the dashboard are saved in the database, so they survive restarts. */
-    async addKeys(text: string, role: Role) {
-        const r: Role = (["any", "write", "review", "pics"] as Role[]).includes(role) ? role : "any";
-        const list = [...new Set(String(text || "").split(/[\n,;\s]+/).map((x) => x.trim()).filter((x) => x.length > 8))].slice(0, 100);
-        const added = this.pool.addKeys(list.join("\n"), r);
-        for (const key of list) {
-            const row = await this.prisma.pipelineKey.upsert({ where: { key }, update: { role: r }, create: { key, role: r } });
-            this.dbIds.set(key, row.id);
-        }
-        this.kickWaiting();
-        return { added, total: this.pool.keys.length };
-    }
-    async removeKey(id: number) {
-        const row = await this.prisma.pipelineKey.findUnique({ where: { id } });
-        if (!row) throw new NotFoundException("Key not found");
-        await this.prisma.pipelineKey.delete({ where: { id } });
-        this.dbIds.delete(row.key);
-        const k = this.pool.keys.find((x) => x.key === row.key); if (k) this.pool.remove(k);
-        return { ok: true };
-    }
-    /** Gives every key another chance (cooling or marked invalid), and wakes up a waiting job. */
-    reviveKeys() { this.pool.reviveAll(); this.kickWaiting(); return { ok: true }; }
-    private async kickWaiting() {
-        await this.prisma.pipelineJob.updateMany({ where: { status: "waiting" }, data: { status: "queued" } }).catch(() => {});
-        this.kick();
-    }
-
-    // ---------------- jobs ----------------
-    async create(user: User, body: { title?: string; config: Cfg; doctors: any[] }) {
-        const doctors: Doctor[] = (body.doctors ?? []).map((d) => ({
-            id: String(d.id || uid()), name: String(d.name || "").trim(), deckId: null, styleText: String(d.styleText || "").slice(0, 80000), styleFile: false,
-            lectures: (d.lectures ?? []).map((l: any): Lecture => ({
-                id: String(l.id || uid()), name: String(l.name || "").trim(), fileName: String(l.fileName || ""), size: Number(l.size) || 0,
-                status: "waiting for file", msg: "", progress: "", stage: "queued", drafts: [], saved: [], rejected: [], deckId: null, extracted: false, rep: emptyRep(),
-            })),
-        }));
-        const c = body.config;
-        const config: Cfg = {
-            subject: String(c.subject || "").trim(), yearId: Number(c.yearId), instructions: String(c.instructions || ""),
-            cardCount: c.cardCount ? Math.floor(Number(c.cardCount)) : null, passes: Math.max(0, Math.min(2, Number(c.passes ?? 1))),
-            colorize: c.colorize !== false, mainColor: c.mainColor || "#009688", hiColor: c.hiColor || "#673ab7", hideNew: !!c.hideNew,
-            threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
-            polishWithFile: c.polishWithFile !== false, cutout: c.cutout !== false,
-            // photos === false -> "3D models only": no web picture search at all, cards only get models from the library
-            optImages: (c as any).photos !== false,
-            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65,
+    plans() {
+        return {
+            monthly: { plan: "MONTHLY", price_usd: PRICE.MONTHLY },
+            yearly: { plan: "YEARLY", price_usd: PRICE.YEARLY, saving_percent: Math.round((1 - PRICE.YEARLY / (PRICE.MONTHLY * 12)) * 100) },
+            methods: [{
+                method: "SHAM_CASH", wallet: process.env.SHAM_CASH_WALLET ?? "", account_name: process.env.SHAM_CASH_NAME ?? "", qr_url: process.env.SHAM_CASH_QR_URL ?? "",
+            }],
         };
-        const job = await this.prisma.pipelineJob.create({
-            data: { title: body.title || `${config.subject}`, user_id: user.id, config: config as any, state: { subjectId: null, doctors, createdAt: Date.now() } as any, log: [] },
+    }
+
+    /** Step 1: the user picks a plan. Returns how much to send and the reference code to write in the transfer note. */
+    async start(userId: number, plan: string) {
+        if (plan !== "MONTHLY" && plan !== "YEARLY") GenerateBadRequestException(["plan must be MONTHLY or YEARLY."]);
+        const open = await this.prisma.aiPayment.count({ where: { user_id: userId, status: { in: ["PENDING", "SUBMITTED"] } } });
+        if (open >= 3) GenerateBadRequestException(["You already have open payment requests. Finish or wait for review."]);
+        const p = await this.prisma.aiPayment.create({
+            data: { user_id: userId, plan, amount_usd: PRICE[plan as "MONTHLY" | "YEARLY"], reference: "AI-" + randomBytes(3).toString("hex").toUpperCase() },
         });
-        return { id: job.id };
+        return { ...this.view(p), ...this.plans().methods[0] };
     }
 
-    async saveFile(jobId: number, lectureId: string, file: Express.Multer.File) {
-        const job = await this.get(jobId);
-        let mime = sniff(file.buffer);
-        // MCQ jobs also accept plain text files (.txt / .md / .csv / .json) that already hold the questions
-        if (!mime && (job.state as any)?.kind === "mcq" && !file.buffer.subarray(0, 4096).includes(0) && !file.buffer.subarray(0, 300).toString("utf8").trimStart().startsWith("<")) mime = "text/plain";
-        if (!mime) {
-            const head = file.buffer.subarray(0, 300).toString("utf8").trimStart().toLowerCase();
-            throw new BadRequestException(head.startsWith("<")
-                ? `"${file.originalname}" is an HTML web page with a .pdf name (usually a failed download or an error page from Drive/Telegram). Download the real PDF again.`
-                : `"${file.originalname}" is not a PDF or an image.`);
-        }
-        const st: any = job.state;
-        const docs = st.doctors as Doctor[];
-        const isStyle = lectureId.startsWith("style_");
-        const doc = isStyle ? docs.find((x) => "style_" + x.id === lectureId) : null;
-        const l = isStyle ? null : docs.flatMap((d) => d.lectures).find((x) => x.id === lectureId);
-        if (!doc && !l) throw new NotFoundException("Lecture not found");
-        await this.prisma.pipelineFile.deleteMany({ where: { job_id: jobId, lecture_id: lectureId } });
-        for (let i = 0, seq = 0; i < file.buffer.length; i += CHUNK, seq++)
-            await this.prisma.pipelineFile.create({ data: { job_id: jobId, lecture_id: lectureId, seq, mime, data: file.buffer.subarray(i, i + CHUNK) as any } });
-        if (doc) doc.styleFile = true; else { l!.status = "queued"; l!.fileName = file.originalname; l!.size = file.size; }
-        await this.prisma.pipelineJob.update({ where: { id: jobId }, data: { state: st } });
-        return { ok: true };
+    /** Step 2: after paying in Sham Cash the user sends the transaction number (+ optional screenshot). */
+    async submit(userId: number, id: number, txId: string, file?: Express.Multer.File) {
+        const p = await this.prisma.aiPayment.findFirst({ where: { id, user_id: userId } });
+        if (!p) GenerateBadRequestException(["Payment request not found."], "Not Found", 404);
+        if (p!.status !== "PENDING") GenerateBadRequestException(["This request was already submitted."]);
+        const tx = String(txId ?? "").trim();
+        if (tx.length < 4 || tx.length > 100) GenerateBadRequestException(["Enter the Sham Cash transaction number."]);
+        if (await this.prisma.aiPayment.findUnique({ where: { tx_id: tx } })) GenerateBadRequestException(["This transaction number was already used."]);
+        const u = await this.prisma.aiPayment.update({
+            where: { id }, data: { tx_id: tx, status: "SUBMITTED", ...(file ? { proof: file.buffer as any, proof_mime: file.mimetype } : {}) },
+        });
+        return this.view(u);
     }
 
-    private async loadFile(jobId: number, lectureId: string) {
-        const rows = await this.prisma.pipelineFile.findMany({ where: { job_id: jobId, lecture_id: lectureId }, orderBy: { seq: "asc" } });
-        if (!rows.length) return null;
-        return { base64: Buffer.concat(rows.map((r) => r.data)).toString("base64"), mime: rows[0].mime };
+    mine(userId: number) {
+        return this.prisma.aiPayment.findMany({ where: { user_id: userId }, orderBy: { created_at: "desc" }, take: 20 }).then((r) => r.map((p) => this.view(p)));
     }
 
-    async get(id: number) {
-        const j = await this.prisma.pipelineJob.findUnique({ where: { id } });
-        if (!j) throw new NotFoundException("Job not found");
-        return j;
+    // ---- admin ----
+    pending() {
+        return this.prisma.aiPayment.findMany({
+            where: { status: "SUBMITTED" }, orderBy: { created_at: "asc" },
+            include: { user: { select: { id: true, name: true, email: true } } },
+        }).then((r) => r.map(({ proof, ...p }) => ({ ...p, has_proof: !!proof })));
+    }
+    async proof(id: number) {
+        const p = await this.prisma.aiPayment.findUnique({ where: { id }, select: { proof: true, proof_mime: true } });
+        if (!p?.proof) GenerateBadRequestException(["No screenshot."], "Not Found", 404);
+        return { buffer: Buffer.from(p!.proof!), mime: p!.proof_mime || "image/jpeg" };
+    }
+    async approve(id: number) {
+        const p = await this.prisma.aiPayment.findUnique({ where: { id } });
+        if (!p || p.status !== "SUBMITTED") GenerateBadRequestException(["Only submitted payments can be approved."]);
+        await this.prisma.aiPayment.update({ where: { id }, data: { status: "APPROVED", reviewed_at: new Date() } });
+        return this.ai.grant(p!.user_id, p!.plan as any, "sham_cash", p!.reference);
+    }
+    async reject(id: number, note?: string) {
+        const p = await this.prisma.aiPayment.findUnique({ where: { id } });
+        if (!p || p.status !== "SUBMITTED") GenerateBadRequestException(["Only submitted payments can be rejected."]);
+        const u = await this.prisma.aiPayment.update({ where: { id }, data: { status: "REJECTED", note: note?.slice(0, 300), reviewed_at: new Date() } });
+        return this.view(u);
     }
 
-    async list() {
-        const jobs = await this.prisma.pipelineJob.findMany({ orderBy: { id: "desc" }, take: 30, select: { id: true, title: true, status: true, message: true, state: true, created_at: true, updated_at: true } });
-        return jobs.map((j) => ({ ...j, ...this.summary(j.state), state: undefined }));
-    }
-
-    private summary(state: any) {
-        const runAt = state?.runAt ?? null;
-        const kind = state?.kind ?? "cards";
-        const ls: Lecture[] = (state?.doctors ?? []).flatMap((d: Doctor) => d.lectures);
-        return {
-            kind, runAt,
-            lectures: ls.map((l) => ({ id: l.id, name: l.name, status: l.status, stage: l.stage, msg: l.msg, progress: l.progress, cards: l.saved.length || l.checked || 0 })),
-            done: ls.filter((l) => l.stage === "done").length, total: ls.length, cards: ls.reduce((n, l) => n + (l.saved.length || l.checked || 0), 0),
-        };
-    }
-
-    async detail(id: number) {
-        const j = await this.get(id);
-        return { id: j.id, title: j.title, status: j.status, message: j.message, log: j.log, report: j.report, ...this.summary(j.state), updated_at: j.updated_at };
-    }
-
-    async start(id: number, runAt?: number) {
-        const j = await this.get(id);
-        const st: any = j.state;
-        if (runAt && runAt > Date.now() + 30_000) {
-            st.runAt = runAt;
-            await this.prisma.pipelineJob.update({ where: { id }, data: { status: "scheduled", message: `Scheduled for ${new Date(runAt).toISOString()}`, state: st } });
-            return { ok: true, scheduled: true };
-        }
-        delete st.runAt; delete st.crashes;
-        for (const l of (st.doctors as Doctor[]).flatMap((d) => d.lectures)) if (l.status === "error") { l.status = l.stage === "written" ? "written" : "queued"; l.msg = ""; }
-        await this.prisma.pipelineJob.update({ where: { id }, data: { status: "queued", message: null, state: st } });
-        this.kick();
-        return { ok: true };
-    }
-
-    async pause(id: number) {
-        if (this.currentId === id) this.pool.stopped = true;
-        else await this.prisma.pipelineJob.updateMany({ where: { id, status: { in: ["queued", "waiting", "scheduled"] } }, data: { status: "paused" } });
-        return { ok: true };
-    }
-
-    async remove(id: number) {
-        if (this.currentId === id) this.pool.stopped = true;
-        await this.prisma.pipelineJob.delete({ where: { id } });
-        return { ok: true };
-    }
-
-    // ---------------- runner (one job at a time: the free server is small) ----------------
-    kick() {
-        if (this.busy) return;
-        this.busy = true;
-        (async () => {
-            try {
-                for (;;) {
-                    const job = await this.prisma.pipelineJob.findFirst({ where: { status: { in: ["queued", "running"] } }, orderBy: { id: "asc" } });
-                    if (!job) break;
-                    const again = await this.runJob(job.id);
-                    if (!again) break;
-                }
-            } catch (e: any) { this.logger.error(String(e?.message || e)); }
-            finally { this.busy = false; this.currentId = null; }
-        })();
-    }
-
-    private scheduleRetry() {
-        clearTimeout(this.retry);
-        this.retry = setTimeout(async () => {
-            await this.prisma.pipelineJob.updateMany({ where: { status: "waiting" }, data: { status: "queued" } });
-            this.kick();
-        }, 20 * 60 * 1000);
-    }
-
-    private async ensureDeck(user: User, title: string, type: "PACKAGE_DECK" | "CARDS_DECK", parentId: number, order: number, visible: boolean): Promise<number> {
-        const t = title.trim();
-        const where = { parent_id: parentId, by_admin: true, title: t } as any;
-        const hit = await this.prisma.deck.findFirst({ where });
-        if (hit) {
-            // subject + doctor are packages, chapters are card decks: never reuse a deck of the wrong kind
-            if (hit.type !== type) throw new Error(`"${t}" already exists here as a ${hit.type === "PACKAGE_DECK" ? "package (folder)" : "card deck"}, but it must be a ${type === "PACKAGE_DECK" ? "package (folder)" : "card deck"}. Rename or delete the old one, then press Resume.`);
-            return hit.id;
-        }
-        if (t.length > MAX_TITLE) throw new Error(`"${t}" is ${t.length} characters. Deck names can be at most ${MAX_TITLE}.`);
-        await this.decks.create(user, { title: t, type, parent_id: parentId, public: false, visible, order } as any);
-        const made = await this.prisma.deck.findFirst({ where: { ...where, type }, orderBy: { id: "desc" } });
-        if (!made) throw new Error(`Created "${t}" but could not find it as a ${type}`);
-        return made.id;
-    }
-
-    private checkedDecks = new Set<number>();
-    /** Cards may only be added to a card deck (chapter), never to a package (subject / doctor). */
-    private async assertCardsDeck(deckId: number) {
-        if (this.checkedDecks.has(deckId)) return;
-        const d = await this.prisma.deck.findUnique({ where: { id: deckId }, select: { type: true } });
-        if (d?.type !== "CARDS_DECK") throw new Error("Cards can only be added to a card deck (chapter), not to a package.");
-        this.checkedDecks.add(deckId);
-    }
-
-    /** "anatomy" (default) | "all" | "off"; older clients only sent use3d. */
-    private mode3d(c: any): "anatomy" | "all" | "off" {
-        const m = (["anatomy", "all", "off"] as const).includes(c?.models3dMode) ? c.models3dMode : c?.use3d === false ? "off" : "anatomy";
-        // "3D models only" (photos off) with models off would do nothing: fall back to the anatomy check
-        return c?.photos === false && m === "off" ? "anatomy" : m;
-    }
-
-    /** What the engine may do with the database: read / fix / delete cards and attach pictures. */
-    private makeIO(user: User, log: string[], persist: () => void): IO {
-        return {
-            log: (m) => { log.unshift(`${new Date().toISOString().slice(11, 19)}  ${m}`); persist(); },
-            persist,
-            saveCard: async (deckId, q, a) => (await this.assertCardsDeck(deckId), await this.cards.create(user, deckId, { type: CardType.BASIC, data: { front: { text: q, size: 14, align: "center" }, back: { text: a, size: 14, align: "center" } } } as any) as any)?.id ?? 0,
-            loadCards: async (deckId) => {
-                const rows = await this.prisma.card.findMany({ where: { deck_id: deckId }, orderBy: { order: "asc" } });
-                return rows.map((r) => {
-                    let data: any = r.data;
-                    for (let n = 0; n < 3 && typeof data === "string"; n++) { try { data = JSON.parse(data); } catch { data = null; } }
-                    return { id: r.id, type: r.type, data, hasPic: !!(r.front_image_name || r.back_image_name) || r.type === CardType.OCCLUSION };
-                });
-            },
-            updateCard: async (deckId, cid, type, data) => { await this.cards.update(user, deckId, cid, { type, data } as any); },
-            deleteCard: async (deckId, cid) => { await this.cards.delete(undefined, deckId, cid); },
-            loadModels: async () => (await this.prisma.model3D.findMany({ orderBy: { name: "asc" } }))
-                .map((m) => ({ id: m.id, name: m.name, aliases: m.aliases ?? "", category: m.category ?? "", file: m.file_name })),
-            attach: async (cid, png) => {
-                const m = await this.media.create({ buffer: png, originalname: `card_${cid}.png`, mimetype: "image/png", size: png.length } as any, MediaType.IMAGE);
-                await this.prisma.card.update({ where: { id: cid }, data: { back_image_name: m.name } });
-            },
-        };
-    }
-
-    // ---------------- Polish jobs: review / fix / duplicates / pictures for decks that ALREADY exist ----------------
-    /** body: { title?, deckIds: number[] (card decks), config?: { threshold, deleteThreshold, pictureThreshold, cutout, optQuality, optDups, optImages, pictureMode } } */
-    async createPolish(user: User, body: any) {
-        const ids: number[] = [...new Set<number>((Array.isArray(body?.deckIds) ? body.deckIds : []).map(Number).filter((x: number) => Number.isInteger(x) && x > 0))].slice(0, 500);
-        if (!ids.length) throw new BadRequestException("Choose at least one lecture deck.");
-        const decks = await this.prisma.deck.findMany({ where: { id: { in: ids } }, select: { id: true, title: true, type: true } });
-        const byId = new Map(decks.map((d) => [d.id, d]));
-        const missing = ids.filter((i) => !byId.has(i) || byId.get(i)!.type !== "CARDS_DECK");
-        if (missing.length) throw new BadRequestException(`These are not card decks (lectures): ${missing.slice(0, 10).join(", ")}.`);
-        const c = body?.config ?? {};
-        const mode = (["smart", "generous", "all"] as const).includes(c.pictureMode) ? c.pictureMode : "generous";
-        const title = String(body?.title || "").trim().slice(0, 120) || `Polish · ${ids.length} lecture${ids.length === 1 ? "" : "s"}`;
-        const config: Cfg = {
-            subject: title, yearId: 0, instructions: "", cardCount: null, passes: 0, colorize: true, mainColor: "#009688", hiColor: "#673ab7", hideNew: false,
-            threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
-            polishWithFile: true, cutout: c.cutout !== false,
-            optQuality: c.optQuality !== false, optDups: c.optDups !== false, optImages: c.optImages !== false, pictureMode: mode,
-            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65,
-        };
-        const lectures: Lecture[] = ids.map((id): Lecture => ({
-            id: `d${id}`, name: byId.get(id)!.title, fileName: "", size: 0, status: "queued", msg: "", progress: "", stage: "written",
-            drafts: [], saved: [], rejected: [], deckId: id, extracted: true, rep: emptyRep(),
-        }));
-        const state = { kind: "polish", subjectId: null, doctors: [{ id: "polish", name: "Polish", deckId: null, styleText: "", styleFile: false, lectures }], createdAt: Date.now() };
-        const job = await this.prisma.pipelineJob.create({ data: { title, user_id: user.id, config: config as any, state: state as any, log: [] } });
-        return { id: job.id };
-    }
-
-    private async runPolishJob(job: any): Promise<boolean> {
-        const id: number = job.id;
-        const cfg = job.config as unknown as Cfg;
-        const st: any = job.state;
-        const doctors: Doctor[] = st.doctors;
-        const lectures = doctors.flatMap((d) => d.lectures);
-        const user = await this.prisma.user.findUnique({ where: { id: job.user_id } });
-        if (!user) { await this.finish(id, "error", "The admin who started this job no longer exists.", st); return true; }
-        this.currentId = id; this.pool.stopped = false;
-        const log: string[] = Array.isArray(job.log) ? (job.log as string[]) : [];
-        let timer: NodeJS.Timeout | undefined;
-        const persist = () => {
-            clearTimeout(timer);
-            timer = setTimeout(() => this.prisma.pipelineJob.update({ where: { id }, data: { state: st, log: log.slice(0, 150) } }).catch(() => {}), 1500);
-        };
-        const io = this.makeIO(user, log, persist);
-        await this.prisma.pipelineJob.update({ where: { id }, data: { status: "running", message: null } });
-        try {
-            if (!this.pool.keys.some((k) => !k.dead)) throw new Error("No AI key on the server. Add keys in Pipeline > AI keys.");
-            const engine = new Engine(this.pool, cfg, io);
-            for (const d of doctors) for (const l of d.lectures) {
-                if (l.stage === "done" || l.deckId == null) continue;
-                if (this.pool.stopped) throw new PoolStopped("Paused");
-                try {
-                    const exists = await this.prisma.deck.findUnique({ where: { id: l.deckId }, select: { id: true } });
-                    if (!exists) { l.status = "error"; l.msg = "This deck was deleted."; continue; }
-                    const src = await this.loadFile(id, l.id); // optional lecture file: lets the reviewer check facts against it
-                    await engine.polishExisting(l, src);
-                    await this.prisma.pipelineFile.deleteMany({ where: { job_id: id, lecture_id: l.id } });
-                } catch (e: any) {
-                    if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e;
-                    l.status = "error"; l.msg = String(e?.message || e); io.log(`${l.name}: ${l.msg}`);
-                }
-                persist();
-            }
-            const failed = lectures.some((l) => l.stage !== "done");
-            clearTimeout(timer);
-            const doneMsg = failed ? "Finished with some lectures failed: see the report, then press Resume." : "Finished.";
-            const rep = this.buildReport(job.title, st, cfg);
-            await this.finish(id, "done", doneMsg, st, log, rep);
-            this.waitMailed.delete(id);
-            await this.notify(user, job.title, "done", doneMsg, rep);
-            return true;
-        } catch (e: any) {
-            clearTimeout(timer);
-            if (e instanceof PoolStopped) { await this.finish(id, "paused", "Paused.", st, log); return false; }
-            if (e instanceof PoolExhausted) {
-                const m = `${e.message} It continues by itself in about 20 minutes. Add more keys in Pipeline > AI keys to speed it up.`;
-                await this.finish(id, "waiting", m, st, log); this.scheduleRetry();
-                if (!this.waitMailed.has(id)) { this.waitMailed.add(id); await this.notify(user, job.title, "waiting", m); }
-                return false;
-            }
-            const rep = this.buildReport(job.title, st, cfg), em = String(e?.message || e);
-            await this.finish(id, "error", em, st, log, rep);
-            await this.notify(user, job.title, "error", em, rep);
-            return true;
-        } finally { clearTimeout(timer); this.pool.stopped = false; }
-    }
-
-    private async runJob(id: number): Promise<boolean> {
-        const job = await this.get(id);
-        if ((job.state as any)?.kind === "mcq") return this.runMcqJob(job);
-        if ((job.state as any)?.kind === "polish") return this.runPolishJob(job);
-        const cfg = job.config as unknown as Cfg;
-        const st: any = job.state;
-        const doctors: Doctor[] = st.doctors;
-        const user = await this.prisma.user.findUnique({ where: { id: job.user_id } });
-        if (!user) { await this.finish(id, "error", "The admin who started this job no longer exists.", st); return true; }
-        this.currentId = id; this.pool.stopped = false;
-        const log: string[] = Array.isArray(job.log) ? (job.log as string[]) : [];
-        let timer: NodeJS.Timeout | undefined;
-        const persist = () => {
-            clearTimeout(timer);
-            timer = setTimeout(() => this.prisma.pipelineJob.update({ where: { id }, data: { state: st, log: log.slice(0, 150) } }).catch(() => {}), 1500);
-        };
-        const io = this.makeIO(user, log, persist);
-        await this.prisma.pipelineJob.update({ where: { id }, data: { status: "running", message: null } });
-        try {
-            if (!this.pool.keys.some((k) => !k.dead)) throw new Error("No AI key on the server. Add keys in Pipeline > AI keys.");
-            io.log("Preparing folders…");
-            st.subjectId = await this.ensureDeck(user, cfg.subject, "PACKAGE_DECK", cfg.yearId, 0, !cfg.hideNew);
-            let di = 0;
-            for (const d of doctors) {
-                di++;
-                if (!d.name || !d.lectures.length) continue;
-                d.deckId ??= await this.ensureDeck(user, d.name, "PACKAGE_DECK", st.subjectId, di, !cfg.hideNew);
-                for (const l of d.lectures) if (l.deckId == null && l.name) l.deckId = await this.ensureDeck(user, l.name, "CARDS_DECK", d.deckId!, d.lectures.indexOf(l) + 1, !cfg.hideNew);
-            }
-            persist();
-            const engine = new Engine(this.pool, cfg, io);
-            for (const d of doctors) {
-                if (d.lectures.some((x) => x.stage !== "done") && !d.styleGuide && (d.styleText?.trim() || d.styleFile)) {
-                    try {
-                        const sf = d.styleFile ? await this.loadFile(id, `style_${d.id}`) : null;
-                        d.styleGuide = await engine.buildStyleGuide(d.name, d.styleText || "", sf);
-                        io.log(`Dr ${d.name}: exam style learned from the previous questions`);
-                        await this.prisma.pipelineFile.deleteMany({ where: { job_id: id, lecture_id: `style_${d.id}` } }); persist();
-                    } catch (e: any) {
-                        if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e;
-                        io.log(`Dr ${d.name}: could not learn the style (${String(e?.message || e)}). Continuing without it.`);
-                    }
-                }
-                engine.setStyle(d.styleGuide || "");
-                for (const l of d.lectures) {
-                if (l.stage === "done" || l.deckId == null) continue;
-                if (this.pool.stopped) throw new PoolStopped("Paused");
-                const src = await this.loadFile(id, l.id);
-                if (!src) { l.status = "error"; l.msg = "The file was not uploaded."; continue; }
-                try {
-                    await engine.processLecture(d, l, src);
-                    await this.prisma.pipelineFile.deleteMany({ where: { job_id: id, lecture_id: l.id } }); // free database space
-                } catch (e: any) {
-                    if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e;
-                    l.status = "error"; l.msg = String(e?.message || e); io.log(`${l.name}: ${l.msg}`);
-                }
-                persist();
-                }
-            }
-            if (cfg.hideNew && doctors.every((d) => d.lectures.every((l) => l.stage === "done"))) {
-                const ids = [st.subjectId, ...doctors.flatMap((d) => [d.deckId, ...d.lectures.map((l) => l.deckId)])].filter((x) => x != null);
-                await this.prisma.deck.updateMany({ where: { id: { in: ids } }, data: { visible: true } }); invalidateHierarchy();
-            }
-            const failed = doctors.some((d) => d.lectures.some((l) => l.stage !== "done"));
-            clearTimeout(timer);
-            const doneMsg = failed ? "Finished with some lectures failed: see the report, then press Resume." : "Finished.";
-            const rep = this.buildReport(job.title, st, cfg);
-            await this.finish(id, "done", doneMsg, st, log, rep);
-            this.waitMailed.delete(id);
-            await this.notify(user, job.title, "done", doneMsg, rep);
-            return true;
-        } catch (e: any) {
-            clearTimeout(timer);
-            if (e instanceof PoolStopped) { await this.finish(id, "paused", "Paused.", st, log); return false; }
-            if (e instanceof PoolExhausted) {
-                const m = `${e.message} It continues by itself in about 20 minutes. Add more keys in Pipeline > AI keys to speed it up.`;
-                await this.finish(id, "waiting", m, st, log); this.scheduleRetry();
-                if (!this.waitMailed.has(id)) { this.waitMailed.add(id); await this.notify(user, job.title, "waiting", m); } // one email per job, not one every retry
-                return false;
-            }
-            const rep = this.buildReport(job.title, st, cfg), em = String(e?.message || e);
-            await this.finish(id, "error", em, st, log, rep);
-            await this.notify(user, job.title, "error", em, rep);
-            return true;
-        } finally { this.pool.stopped = false; }
-    }
-
-
-    // ---------------- MCQ import jobs (same table, same runner, same pause / resume / schedule) ----------------
-    /** body: { title?, subjectId? | subjectName?, files: [{id,name,fileName,size}], instructions?, autoPublish?, publishThreshold? } */
-    async createMcq(user: User, body: any) {
-        const files: any[] = Array.isArray(body?.files) ? body.files : [];
-        if (!files.length) throw new BadRequestException("Add at least one file.");
-        let subjectId = String(body.subjectId || "").trim(), subjectName = String(body.subjectName || "").trim(), isNew = false;
-        if (subjectId) {
-            const s = await this.prisma.mcqSubject.findUnique({ where: { id: subjectId } });
-            if (!s) throw new NotFoundException("That MCQ subject does not exist.");
-            subjectName = s.name;
-        } else {
-            if (!subjectName) throw new BadRequestException("Choose a subject or type a new subject name.");
-            subjectId = slugId(subjectName, "s"); isNew = !(await this.prisma.mcqSubject.findUnique({ where: { id: subjectId } }));
-            if (!isNew) subjectName = (await this.prisma.mcqSubject.findUnique({ where: { id: subjectId } }))!.name;
-        }
-        const cfg: McqCfg = {
-            kind: "mcq", subject: subjectName, instructions: String(body.instructions || "").slice(0, 4000),
-            autoPublish: body.autoPublish !== false, publishThreshold: Math.max(50, Math.min(100, Number(body.publishThreshold) || 90)),
-        };
-        const lectures: Lecture[] = files.map((l: any): Lecture => ({
-            id: String(l.id || uid()), name: String(l.name || "").trim().slice(0, 255) || String(l.fileName || "Questions"), fileName: String(l.fileName || ""), size: Number(l.size) || 0,
-            status: "waiting for file", msg: "", progress: "", stage: "queued", drafts: [], saved: [], rejected: [], deckId: null, extracted: false, rep: emptyRep(),
-        }));
-        const state = { kind: "mcq", subjectId, newSubject: isNew, doctors: [{ id: "mcq", name: "MCQ", deckId: null, styleText: "", styleFile: false, lectures }], createdAt: Date.now() };
-        const job = await this.prisma.pipelineJob.create({ data: { title: body.title || `MCQ · ${subjectName}`, user_id: user.id, config: cfg as any, state: state as any, log: [] } });
-        return { id: job.id };
-    }
-
-    private async runMcqJob(job: any): Promise<boolean> {
-        const id: number = job.id;
-        const cfg = job.config as McqCfg;
-        const st: any = job.state;
-        const lectures: (Lecture & { colId?: string })[] = (st.doctors as Doctor[]).flatMap((d) => d.lectures);
-        const user = await this.prisma.user.findUnique({ where: { id: job.user_id } });
-        if (!user) { await this.finish(id, "error", "The admin who started this job no longer exists.", st); return true; }
-        this.currentId = id; this.pool.stopped = false;
-        const log: string[] = Array.isArray(job.log) ? (job.log as string[]) : [];
-        let timer: NodeJS.Timeout | undefined;
-        const persist = () => {
-            clearTimeout(timer);
-            timer = setTimeout(() => this.prisma.pipelineJob.update({ where: { id }, data: { state: st, log: log.slice(0, 150) } }).catch(() => {}), 1500);
-        };
-        const importBank = (body: any) => this.mcq.importBank(body, { dryRun: false, strict: false }) as any;
-        await this.prisma.pipelineJob.update({ where: { id }, data: { status: "running", message: null } });
-        try {
-            if (!this.pool.keys.some((k) => !k.dead)) throw new Error("No AI key on the server. Add keys in Pipeline > AI keys.");
-            const io = { log: (m: string) => { log.unshift(`${new Date().toISOString().slice(11, 19)}  ${m}`); persist(); }, persist, importBank };
-            if (st.newSubject && !st.subjectMade) {
-                const r = await importBank({ subjects: [{ id: st.subjectId, name: cfg.subject }] });
-                if (!r.applied) throw new Error(r.issues.map((i: any) => i.message).join("; ") || "Could not create the subject.");
-                st.subjectMade = true; persist();
-            }
-            const engine = new McqEngine(this.pool, cfg, io);
-            for (const l of lectures) {
-                if (l.stage === "done") continue;
-                if (this.pool.stopped) throw new PoolStopped("Paused");
-                const src = await this.loadFile(id, l.id);
-                if (!src) { l.status = "error"; l.msg = "The file was not uploaded."; continue; }
-                try {
-                    await engine.processFile(l, src, st.subjectId, `${st.subjectId.slice(0, 40)}-${slugId(l.id + l.name, "c").slice(-12)}`.slice(0, 64));
-                    await this.prisma.pipelineFile.deleteMany({ where: { job_id: id, lecture_id: l.id } });
-                } catch (e: any) {
-                    if (e instanceof PoolStopped || e instanceof PoolExhausted) throw e;
-                    l.status = "error"; l.msg = String(e?.message || e); io.log(`${l.name}: ${l.msg}`);
-                }
-                persist();
-            }
-            const failed = lectures.some((l) => l.stage !== "done");
-            clearTimeout(timer);
-            const doneMsg = failed ? "Finished with some files failed: see the report, then press Resume." : "Finished.";
-            const rep = this.buildMcqReport(job.title, st, cfg, lectures);
-            await this.finish(id, "done", doneMsg, st, log, rep);
-            this.waitMailed.delete(id);
-            await this.notify(user, job.title, "done", doneMsg, rep);
-            return true;
-        } catch (e: any) {
-            clearTimeout(timer);
-            if (e instanceof PoolStopped) { await this.finish(id, "paused", "Paused.", st, log); return false; }
-            if (e instanceof PoolExhausted) {
-                const m = `${e.message} It continues by itself in about 20 minutes. Add more keys in Pipeline > AI keys to speed it up.`;
-                await this.finish(id, "waiting", m, st, log); this.scheduleRetry();
-                if (!this.waitMailed.has(id)) { this.waitMailed.add(id); await this.notify(user, job.title, "waiting", m); }
-                return false;
-            }
-            const rep = this.buildMcqReport(job.title, st, cfg, lectures), em = String(e?.message || e);
-            await this.finish(id, "error", em, st, log, rep);
-            await this.notify(user, job.title, "error", em, rep);
-            return true;
-        } finally { this.pool.stopped = false; }
-    }
-
-    private buildMcqReport(title: string, st: any, cfg: McqCfg, ls: (Lecture & { colId?: string; aiPicked?: number })[]) {
-        const sum = (f: (l: any) => number) => ls.reduce((n, l) => n + f(l), 0);
-        return {
-            kind: "mcq", title, subject: cfg.subject, subjectId: st.subjectId, finishedAt: new Date().toISOString(), startedAt: new Date(st.createdAt || Date.now()).toISOString(),
-            settings: { autoPublish: cfg.autoPublish, publishThreshold: cfg.publishThreshold },
-            totals: {
-                lectures: ls.length, lecturesDone: ls.filter((l) => l.stage === "done").length, questions: sum((l) => l.saved.length),
-                aiPicked: sum((l) => l.aiPicked ?? 0), attention: sum((l) => l.rep?.lowConf?.length ?? 0), unreadable: sum((l) => l.rejected.length),
-            },
-            collectionIds: ls.map((l) => l.colId).filter(Boolean),
-            lectures: ls.map((l) => ({ name: l.name, fileName: l.fileName, collectionId: l.colId ?? null, status: l.stage === "done" ? "done" : l.status, error: l.stage === "done" ? "" : l.msg, questions: l.saved.length, aiPicked: l.aiPicked ?? 0, lowConf: l.rep?.lowConf ?? [], unreadable: l.rejected.slice(0, 50) })),
-        };
-    }
-
-    /** Publishes every question of a finished MCQ job, except the ones still waiting for the admin's check. */
-    async mcqPublish(id: number) {
-        const j = await this.get(id);
-        if ((j.state as any)?.kind !== "mcq") throw new BadRequestException("This is not an MCQ job.");
-        const rep: any = j.report;
-        const ids: string[] = rep?.collectionIds ?? [];
-        const keep: string[] = (rep?.lectures ?? []).flatMap((l: any) => (l.lowConf ?? []).map((x: any) => x.id));
-        return this.mcq.publishImported(ids, keep, true);
-    }
-
-    /** Email to the admin who started the job: finished, stopped by an error, or waiting for AI keys. */
-    private async notify(user: User, title: string, status: string, message: string, report?: any) {
-        try {
-            if (!user.email) return;
-            const t = report?.totals;
-            const lines = [`Job: ${title}`, `Status: ${status}`, message];
-            if (t && report?.kind === "mcq") lines.push("", `Files: ${t.lecturesDone}/${t.lectures}`, `Questions: ${t.questions}`, `Answer chosen by the AI: ${t.aiPicked}`, `Need your check: ${t.attention}`);
-            else if (t) lines.push("", `Lectures: ${t.lecturesDone}/${t.lectures}`, `Cards: ${t.cards}`, `Fixed: ${t.fixed}`, `Deleted: ${t.deleted}`, `3D models added: ${t.models ?? 0}`, `Pictures added: ${t.pictures}`, `Need your attention: ${t.attention}`);
-            for (const l of report?.lectures ?? []) if (l.error) lines.push(`Problem in "${l.name}": ${l.error}`);
-            const url = process.env.DASHBOARD_URL; lines.push("", url ? `Open the report: ${url.replace(/\/$/, "")}/pipeline` : "Open the dashboard > Pipeline to see the full report.");
-            const subject = status === "done" ? `✅ Pipeline finished: ${title}` : status === "waiting" ? `⏸ Pipeline waiting for AI keys: ${title}` : `⚠️ Pipeline stopped: ${title}`;
-            await this.email.notify(user.email, subject, lines.join("\n"));
-        } catch {}
-    }
-
-    private async finish(id: number, status: string, message: string, state: any, log?: string[], report?: any) {
-        if (state && status !== "running") state.crashes = 0;
-        await this.prisma.pipelineJob.update({ where: { id }, data: { status, message, state, ...(log ? { log: log.slice(0, 150) } : {}), ...(report ? { report } : {}) } }).catch(() => {});
-    }
-
-    private buildReport(title: string, st: any, cfg: Cfg) {
-        const ls = (st.doctors as Doctor[]).flatMap((d) => d.lectures.map((l) => ({ d, l })));
-        const sum = (f: (l: Lecture) => number) => ls.reduce((n, { l }) => n + f(l), 0);
-        return {
-            title, subject: cfg.subject, finishedAt: new Date().toISOString(), startedAt: new Date(st.createdAt || Date.now()).toISOString(),
-            settings: { photos: cfg.optImages !== false, threshold: cfg.threshold, pictureThreshold: cfg.pictureThreshold ?? cfg.threshold, deleteThreshold: cfg.deleteThreshold, passes: cfg.passes, checkedAgainstFile: cfg.polishWithFile },
-            totals: {
-                lectures: ls.length, lecturesDone: ls.filter(({ l }) => l.stage === "done").length, cards: sum((l) => l.saved.length || l.checked || 0),
-                fixed: sum((l) => l.rep?.fixes?.length ?? 0), deleted: sum((l) => l.rep?.deleted?.length ?? 0),
-                models: sum((l) => l.rep?.models?.length ?? 0), pictures: sum((l) => l.rep?.pictures?.length ?? 0), noPicture: sum((l) => l.rep?.noPicture?.length ?? 0), attention: sum((l) => l.rep?.lowConf?.length ?? 0),
-            },
-            styles: (st.doctors as Doctor[]).filter((d) => d.styleGuide).map((d) => ({ doctor: d.name, guide: d.styleGuide })),
-            lectures: ls.map(({ d, l }) => ({ doctor: d.name, name: l.name, status: l.stage === "done" ? "done" : l.status, error: l.stage === "done" ? "" : l.msg, cards: l.saved.length || l.checked || 0, ...l.rep })),
-            keys: this.keys(),
-        };
+    private view(p: any) {
+        return { id: p.id, plan: p.plan, amount_usd: Number(p.amount_usd), method: p.method, reference: p.reference, status: p.status, tx_id: p.tx_id, note: p.note, created_at: p.created_at };
     }
 }
