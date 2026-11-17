@@ -13,7 +13,7 @@ import { GenerateBadRequestException } from "src/exception/bad-request.exception
 import { GenerateUnauthorizedException } from "src/exception/unauthorized.exception";
 import { EmailService } from "./email.service";
 import { generateRandomCode } from "src/utils/code-generation.utils";
-import * as md5 from "md5";
+import { md5 } from "src/utils/md5";
 import { v7 as uuid } from "uuid";
 import { ResendActivationCodeDto } from "src/dtos/auth/resend-activation-code.dto";
 import { GenerateUnprocessableEntityException } from "src/exception/unprocessable-entity.exception";
