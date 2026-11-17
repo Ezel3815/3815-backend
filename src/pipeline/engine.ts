@@ -6,6 +6,24 @@ import sharp = require("sharp");
 import { cleanCardHtml } from "./card-html";
 import { geminiJson } from "./gemini-json";
 import { KeyPool, PoolExhausted, PoolStopped, isClaudeKey, canSeePictures } from "./key-pool";
+import { findLocalDuplicates, jacc, norm, plain, toks } from "./dup-scan";
+import { Semaphore } from "./mem-gate";
+
+// Pictures: libvips keeps a cache and uses several threads by default. On a small server that is wasted memory.
+sharp.cache(false);
+sharp.concurrency(1);
+// At most 3 pictures are downloaded + decoded at the same time, no matter how many lectures / cards ask at once.
+const IMG_SLOTS = new Semaphore(3);
+const IMG_FETCH_MS = 25_000;
+const IMG_MAX_BYTES = 12 * 1024 * 1024; // a candidate bigger than this is skipped, not decoded
+/** Downloads a picture with a timeout and a size limit (a hanging or huge download used to hold memory and block the lane). */
+async function fetchImage(url: string, ua: string): Promise<Buffer | null> {
+    const r = await fetch(url, { headers: { "User-Agent": ua }, signal: AbortSignal.timeout(IMG_FETCH_MS) });
+    if (!r.ok) return null;
+    if (Number(r.headers.get("content-length")) > IMG_MAX_BYTES) { await r.body?.cancel().catch(() => {}); return null; }
+    const buf = Buffer.from(await r.arrayBuffer());
+    return buf.length > IMG_MAX_BYTES ? null : buf;
+}
 
 export interface Draft { question: string; answer: string; status: string; msg: string }
 export interface LRep { fixes: any[]; deleted: any[]; pictures: any[]; noPicture: string[]; lowConf: any[]; models?: any[] }
@@ -59,10 +77,6 @@ interface Rem { c: PCard; reason: string; conf: number; apply: boolean; st: St; 
 interface Img { c: PCard; idea: string; cands: Cand[]; pick: number; reason: string; conf: number; apply: boolean; bg: boolean; st: St; msg: string; preview: string }
 
 const UA = "MozaikPipeline/1.0 (flashcard app; contact: admin)";
-const plain = (h: string) => (h ?? "").replace(/<[^>]*>/g, " ").replace(/&nbsp;|&[a-z]+;/g, " ").replace(/\s+/g, " ").trim();
-const norm = (h: string) => plain(h).toLowerCase().replace(/[ً-ٰٟ]/g, "").replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
-const toks = (s: string) => new Set(norm(s).split(" ").filter((w) => w.length > 1));
-const jacc = (a: Set<string>, b: Set<string>) => { if (!a.size && !b.size) return 1; let i = 0; a.forEach((x) => b.has(x) && i++); return i / (a.size + b.size - i); };
 const clamp = (n: any) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
 
 
@@ -86,7 +100,7 @@ export class Engine {
     }
     lastChecked = 0;
     /** How many AI jobs run side by side: one per working key (max 4), so keys are not hammered. */
-    private conc(withFile = false) { return Math.max(1, Math.min(4, this.pool.keys.filter((k) => !k.dead).length)); }
+    private conc(withFile = false) { return Math.max(1, Math.min(withFile ? 2 : 4, this.pool.keys.filter((k) => !k.dead).length)); }
     private async pmap<T>(items: T[], n: number, fn: (x: T) => Promise<void>) {
         let i = 0;
         await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) { this.chk(); await fn(items[i++]); } }));
@@ -217,12 +231,7 @@ Return ONLY a JSON array: [ { "question": "...", "answer": "..." } ]`,
 
         // 1) duplicates: local similarity first (free), then one AI pass over the whole deck
         if (this.optDups) {
-            const t = cards.map((c) => ({ c, q: toks(c.q), a: toks(c.a) }));
-            for (let i = 0; i < t.length; i++) for (let j = i + 1; j < t.length; j++) {
-                if (gone.has(t[i].c.id) || gone.has(t[j].c.id)) continue;
-                const same = norm(t[i].c.q) === norm(t[j].c.q) ? jacc(t[i].a, t[j].a) >= 0.6 : jacc(t[i].q, t[j].q) >= 0.9 && jacc(t[i].a, t[j].a) >= 0.8;
-                if (!same) continue;
-                const [keep, del] = t[i].c.a.length >= t[j].c.a.length ? [t[i].c, t[j].c] : [t[j].c, t[i].c];
+            for (const { keep, del } of await findLocalDuplicates(cards, () => this.chk())) {
                 gone.add(del.id);
                 this.dups.push({ c: del, keeper: keep, reason: "Same question and answer", conf: 97, apply: false, st: "idle", msg: "" });
             }
@@ -423,7 +432,7 @@ Cards (HTML):
 ${JSON.stringify(part.map((c) => ({ id: c.id, q: c.q, a: c.a })))}`;
     }
 
-    private async getJson(url: string) { const r = await fetch(url, { headers: { "User-Agent": UA } }); if (!r.ok) throw new Error(String(r.status)); return r.json(); }
+    private async getJson(url: string) { const r = await fetch(url, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(IMG_FETCH_MS) }); if (!r.ok) throw new Error(String(r.status)); return r.json(); }
     private readonly IMGQ = "&prop=imageinfo&iiprop=url|mime|extmetadata&iiurlwidth=600&iiextmetadatafilter=LicenseShortName";
     private async searchCands(terms: string[]): Promise<Cand[]> {
         const perTerm = await Promise.all(terms.map(async (t) => {
@@ -566,10 +575,12 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
     }
     private async jpegB64(url: string): Promise<{ base64: string; mime: string } | null> {
         try {
-            const r = await fetch(url, { headers: { "User-Agent": UA } }); if (!r.ok) return null;
-            const buf = await sharp(Buffer.from(await r.arrayBuffer())).resize(512, 512, { fit: "inside", withoutEnlargement: true })
-                .flatten({ background: "#ffffff" }).jpeg({ quality: 82 }).toBuffer();
-            return { base64: buf.toString("base64"), mime: "image/jpeg" };
+            return await IMG_SLOTS.run(async () => {
+                const raw = await fetchImage(url, UA); if (!raw) return null;
+                const buf = await sharp(raw, { limitInputPixels: 50_000_000 }).resize(512, 512, { fit: "inside", withoutEnlargement: true })
+                    .flatten({ background: "#ffffff" }).jpeg({ quality: 82 }).toBuffer();
+                return { base64: buf.toString("base64"), mime: "image/jpeg" };
+            });
         } catch { return null; }
     }
     /** Server replacement for the browser cutout model: only removes a plain WHITE background (flood fill from the edges). */
@@ -594,10 +605,12 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
         return sharp(data, { raw: { width: w, height: h, channels: 4 } }).png().toBuffer();
     }
     private async doImage(m: Img) {
-        const res = await fetch(m.cands[m.pick].thumb, { headers: { "User-Agent": UA } });
-        if (!res.ok) throw new Error("download " + res.status);
-        let png = await sharp(Buffer.from(await res.arrayBuffer())).resize(800, 800, { fit: "inside", withoutEnlargement: true }).png().toBuffer();
-        if (m.bg) png = await this.whiteToAlpha(png);
+        const png = await IMG_SLOTS.run(async () => {
+            const raw = await fetchImage(m.cands[m.pick].thumb, UA);
+            if (!raw) throw new Error("download failed or the picture is too big");
+            const out = await sharp(raw, { limitInputPixels: 50_000_000 }).resize(800, 800, { fit: "inside", withoutEnlargement: true }).png().toBuffer();
+            return m.bg ? await this.whiteToAlpha(out) : out;
+        });
         await this.io.attach(m.c.id, png);
     }
 
