@@ -10,6 +10,7 @@ import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 import { Cfg, Doctor, Engine, IO, Lecture } from "./engine";
 import { KeyPool, PoolExhausted, PoolStopped, Role, keyLabel } from "./key-pool";
 import { McqCfg, McqEngine, slugId } from "./mcq-engine";
+import { memLine } from "./mem-gate";
 
 const MAX_TITLE = 60; // longest deck name allowed (same limit as the deck DTOs)
 const CHUNK = 4 * 1024 * 1024;
@@ -45,6 +46,9 @@ export class PipelineService implements OnApplicationBootstrap {
     // After a restart/redeploy of the free server, unfinished jobs continue by themselves.
     onApplicationBootstrap() {
         this.loadKeys();
+        // While a job runs, the memory use goes into the server log every 30 s. If the host ever kills the server, the last
+        // "[mem]" lines before it show how close to the limit it was.
+        setInterval(() => { if (this.currentId != null) this.logger.log(`[mem] job #${this.currentId} ${memLine()}`); }, 30_000).unref();
         // scheduled jobs: checked every minute (they are stored in the database, so a restart does not lose them)
         setInterval(async () => {
             try {
@@ -63,7 +67,8 @@ export class PipelineService implements OnApplicationBootstrap {
                     const st: any = j.state ?? {};
                     st.crashes = (Number(st.crashes) || 0) + 1;
                     const stop = st.crashes >= 3;
-                    await this.prisma.pipelineJob.update({ where: { id: j.id }, data: { status: stop ? "paused" : "queued", state: st, message: stop ? "The server crashed 3 times while running this job (almost always: out of memory). Raise the server memory limit (NODE_OPTIONS=--max-old-space-size), then press Resume." : null } });
+                    if (stop) st.safeMode = true; // Resume clears the crash counter, but this job keeps running one lecture at a time
+                    await this.prisma.pipelineJob.update({ where: { id: j.id }, data: { status: stop ? "paused" : "queued", state: st, message: stop ? "The server crashed 3 times while running this job (almost always: out of memory). Press Resume to try again: it will now work on one lecture at a time. (The server log has [mem] lines from just before each crash.)" : null } });
                 }
             } catch {}
             this.kick();
@@ -157,10 +162,27 @@ export class PipelineService implements OnApplicationBootstrap {
         return { ok: true };
     }
 
+    // Reading a lecture file back is the biggest short memory spike: all its rows, the joined copy and the base64 text exist at once
+    // (about 4x the file). When a job starts, every lane used to do this at the same moment. Now one file is read at a time, and its
+    // rows are fetched one by one instead of all together.
+    private fileLock: Promise<void> = Promise.resolve();
     private async loadFile(jobId: number, lectureId: string) {
-        const rows = await this.prisma.pipelineFile.findMany({ where: { job_id: jobId, lecture_id: lectureId }, orderBy: { seq: "asc" } });
-        if (!rows.length) return null;
-        return { base64: Buffer.concat(rows.map((r) => r.data)).toString("base64"), mime: rows[0].mime };
+        const turn = this.fileLock;
+        let done!: () => void;
+        this.fileLock = new Promise<void>((r) => (done = r));
+        await turn;
+        try {
+            const parts = await this.prisma.pipelineFile.findMany({ where: { job_id: jobId, lecture_id: lectureId }, orderBy: { seq: "asc" }, select: { id: true, mime: true } });
+            if (!parts.length) return null;
+            const chunks: Uint8Array[] = [];
+            for (const p of parts) {
+                const row = await this.prisma.pipelineFile.findUnique({ where: { id: p.id }, select: { data: true } });
+                if (row) chunks.push(row.data);
+            }
+            const joined = Buffer.concat(chunks);
+            chunks.length = 0;
+            return { base64: joined.toString("base64"), mime: parts[0].mime };
+        } finally { done(); }
     }
 
     async get(id: number) {
@@ -169,9 +191,26 @@ export class PipelineService implements OnApplicationBootstrap {
         return j;
     }
 
+    // The dashboard asks for this list every 6 seconds. The job `state` holds every card of every lecture, so reading it for all
+    // 30 jobs each time meant megabytes of JSON per request. Now only jobs that changed since the last request are read in full.
+    private sumCache = new Map<number, { t: number; sum: ReturnType<PipelineService["summary"]> }>();
     async list() {
-        const jobs = await this.prisma.pipelineJob.findMany({ orderBy: { id: "desc" }, take: 30, select: { id: true, title: true, status: true, message: true, state: true, created_at: true, updated_at: true } });
-        return jobs.map((j) => ({ ...j, ...this.summary(j.state), state: undefined }));
+        const jobs = await this.prisma.pipelineJob.findMany({ orderBy: { id: "desc" }, take: 30, select: { id: true, title: true, status: true, message: true, created_at: true, updated_at: true } });
+        const stale = jobs.filter((j) => this.sumCache.get(j.id)?.t !== j.updated_at.getTime());
+        if (stale.length) {
+            const rows = await this.prisma.pipelineJob.findMany({ where: { id: { in: stale.map((j) => j.id) } }, select: { id: true, state: true } });
+            for (const r of rows) this.sumCache.set(r.id, { t: stale.find((j) => j.id === r.id)!.updated_at.getTime(), sum: this.summary(r.state) });
+        }
+        const shown = new Set(jobs.map((j) => j.id));
+        for (const id of [...this.sumCache.keys()]) if (!shown.has(id)) this.sumCache.delete(id);
+        return jobs.map((j) => ({ ...j, ...(this.sumCache.get(j.id)?.sum ?? this.summary(null)) }));
+    }
+
+    /** Only the log lines of a job (the dashboard polls this for open jobs; detail() also returns the whole report). */
+    async logOf(id: number) {
+        const j = await this.prisma.pipelineJob.findUnique({ where: { id }, select: { log: true } });
+        if (!j) throw new NotFoundException("Job not found");
+        return { log: j.log ?? [] };
     }
 
     private summary(state: any) {
@@ -243,7 +282,8 @@ export class PipelineService implements OnApplicationBootstrap {
     }
 
     /** How many lectures run side by side: the "parallel" setting (default 2), but never more than the working AI keys, so keys are not hammered. */
-    private lanes(cfg: any, tasks: number) {
+    private lanes(cfg: any, tasks: number, st?: any) {
+        if ((Number(st?.crashes) || 0) >= 1 || st?.safeMode) return 1; // the server died while running this job: go slow and safe
         const keys = this.pool.keys.filter((k) => !k.dead).length;
         return Math.max(1, Math.min(Math.floor(Number(cfg?.parallel)) || 2, 3, keys, tasks));
     }
@@ -299,7 +339,7 @@ export class PipelineService implements OnApplicationBootstrap {
     /** What the engine may do with the database: read / fix / delete cards and attach pictures. */
     private makeIO(user: User, log: string[], persist: () => void): IO {
         return {
-            log: (m) => { log.unshift(`${new Date().toISOString().slice(11, 19)}  ${m}`); persist(); },
+            log: (m) => { log.unshift(`${new Date().toISOString().slice(11, 19)}  ${m}`); if (log.length > 150) log.length = 150; persist(); },
             persist,
             saveCard: async (deckId, q, a) => (await this.assertCardsDeck(deckId), await this.cards.create(user, deckId, { type: CardType.BASIC, data: { front: { text: q, size: 14, align: "center" }, back: { text: a, size: 14, align: "center" } } } as any) as any)?.id ?? 0,
             loadCards: async (deckId) => {
@@ -369,7 +409,7 @@ export class PipelineService implements OnApplicationBootstrap {
         try {
             if (!this.pool.keys.some((k) => !k.dead)) throw new Error("No AI key on the server. Add keys in Pipeline > AI keys.");
             const tasks = lectures.filter((l) => l.stage !== "done" && l.deckId != null);
-            const lanes = this.lanes(cfg, tasks.length);
+            const lanes = this.lanes(cfg, tasks.length, st);
             if (lanes > 1) io.log(`Working on ${lanes} lectures at the same time`);
             await this.runLectures(tasks, lanes, async (l) => {
                 try {
@@ -454,7 +494,7 @@ export class PipelineService implements OnApplicationBootstrap {
             }
             // lectures run side by side (each with its own engine: an engine keeps the state of ONE lecture)
             const tasks = doctors.flatMap((d) => d.lectures.filter((l) => l.stage !== "done" && l.deckId != null).map((l) => ({ d, l })));
-            const lanes = this.lanes(cfg, tasks.length);
+            const lanes = this.lanes(cfg, tasks.length, st);
             if (lanes > 1) io.log(`Working on ${lanes} lectures at the same time`);
             await this.runLectures(tasks, lanes, async ({ d, l }) => {
                 const src = await this.loadFile(id, l.id);
@@ -544,7 +584,7 @@ export class PipelineService implements OnApplicationBootstrap {
         await this.prisma.pipelineJob.update({ where: { id }, data: { status: "running", message: null } });
         try {
             if (!this.pool.keys.some((k) => !k.dead)) throw new Error("No AI key on the server. Add keys in Pipeline > AI keys.");
-            const io = { log: (m: string) => { log.unshift(`${new Date().toISOString().slice(11, 19)}  ${m}`); persist(); }, persist, importBank };
+            const io = { log: (m: string) => { log.unshift(`${new Date().toISOString().slice(11, 19)}  ${m}`); if (log.length > 150) log.length = 150; persist(); }, persist, importBank };
             if (st.newSubject && !st.subjectMade) {
                 const r = await importBank({ subjects: [{ id: st.subjectId, name: cfg.subject }] });
                 if (!r.applied) throw new Error(r.issues.map((i: any) => i.message).join("; ") || "Could not create the subject.");
