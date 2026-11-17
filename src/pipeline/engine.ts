@@ -84,7 +84,7 @@ export class Engine {
     }
     lastChecked = 0;
     /** How many AI jobs run side by side: one per working key (max 4), so keys are not hammered. */
-    private conc() { return Math.max(1, Math.min(4, this.pool.keys.filter((k) => !k.dead).length)); }
+    private conc(withFile = false) { return Math.max(1, Math.min(withFile ? 2 : 4, this.pool.keys.filter((k) => !k.dead).length)); }
     private async pmap<T>(items: T[], n: number, fn: (x: T) => Promise<void>) {
         let i = 0;
         await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) { this.chk(); await fn(items[i++]); } }));
@@ -253,7 +253,7 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
         if (this.optQuality || this.optImages) {
             const live = cards.filter((c) => !gone.has(c.id));
             const starts: number[] = []; for (let s = 0; s < live.length; s += 20) starts.push(s);
-            await this.pmap(starts, this.conc(), async (s) => {
+            await this.pmap(starts, this.conc(!!src), async (s) => {
                 this.progress = `${d.title}: reviewing cards ${s + 1}-${Math.min(s + 20, live.length)} of ${live.length}`;
                 const part = live.slice(s, s + 20);
                 const { data } = await this.ai(this.reviewPrompt(d.title, part, !!src), {
