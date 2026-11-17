@@ -41,7 +41,7 @@ export class PaymentsService {
         if (tx.length < 4 || tx.length > 100) GenerateBadRequestException(["Enter the Sham Cash transaction number."]);
         if (await this.prisma.aiPayment.findUnique({ where: { tx_id: tx } })) GenerateBadRequestException(["This transaction number was already used."]);
         const u = await this.prisma.aiPayment.update({
-            where: { id }, data: { tx_id: tx, status: "SUBMITTED", ...(file ? { proof: file.buffer, proof_mime: file.mimetype } : {}) },
+            where: { id }, data: { tx_id: tx, status: "SUBMITTED", ...(file ? { proof: file.buffer as any, proof_mime: file.mimetype } : {}) },
         });
         return this.view(u);
     }
