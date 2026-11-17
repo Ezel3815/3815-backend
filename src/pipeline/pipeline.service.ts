@@ -151,7 +151,7 @@ export class PipelineService implements OnApplicationBootstrap {
         if (!doc && !l) throw new NotFoundException("Lecture not found");
         await this.prisma.pipelineFile.deleteMany({ where: { job_id: jobId, lecture_id: lectureId } });
         for (let i = 0, seq = 0; i < file.buffer.length; i += CHUNK, seq++)
-            await this.prisma.pipelineFile.create({ data: { job_id: jobId, lecture_id: lectureId, seq, mime, data: file.buffer.subarray(i, i + CHUNK) } });
+            await this.prisma.pipelineFile.create({ data: { job_id: jobId, lecture_id: lectureId, seq, mime, data: file.buffer.subarray(i, i + CHUNK) as any } });
         if (doc) doc.styleFile = true; else { l!.status = "queued"; l!.fileName = file.originalname; l!.size = file.size; }
         await this.prisma.pipelineJob.update({ where: { id: jobId }, data: { state: st } });
         return { ok: true };
@@ -160,7 +160,7 @@ export class PipelineService implements OnApplicationBootstrap {
     private async loadFile(jobId: number, lectureId: string) {
         const rows = await this.prisma.pipelineFile.findMany({ where: { job_id: jobId, lecture_id: lectureId }, orderBy: { seq: "asc" } });
         if (!rows.length) return null;
-        return { base64: Buffer.concat(rows.map((r) => r.data as Buffer)).toString("base64"), mime: rows[0].mime };
+        return { base64: Buffer.concat(rows.map((r) => r.data)).toString("base64"), mime: rows[0].mime };
     }
 
     async get(id: number) {
