@@ -1,5 +1,6 @@
 import {
     IsArray,
+    IsInt,
     IsNotIn,
     IsNumber,
     IsOptional,
@@ -19,4 +20,10 @@ export class UpdateCodeDto {
     @IsArray()
     @IsNumber(undefined, { each: true })
     decks_ids: number[];
+
+    // VIP code: how many different students may use it. Leave out for a normal single-use code.
+    @IsOptional()
+    @IsInt()
+    @Min(1)
+    max_uses?: number;
 }
