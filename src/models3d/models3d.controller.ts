@@ -23,6 +23,9 @@ export class Models3dController {
         return this.s.create(file, body);
     }
 
+    /** Muscle + the bones it attaches to, as one model. Body: { model_id, bone_ids: [] } */
+    @DRole() @Post("combine") combine(@Body() body: { model_id?: number; bone_ids?: number[] }) { return this.s.combine(Number(body?.model_id), Array.isArray(body?.bone_ids) ? body.bone_ids : []); }
+
     @DRole() @Put(":id") update(@Param("id", ParseIntPipe) id: number, @Body() body: any) { return this.s.update(id, body); }
     @DRole() @Delete(":id") remove(@Param("id", ParseIntPipe) id: number) { return this.s.remove(id); }
 }
