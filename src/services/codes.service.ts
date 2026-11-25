@@ -1,161 +1,293 @@
-import { HttpClient } from "@angular/common/http";
-import { Injectable } from "@angular/core";
-import { TableColumn } from "../../models/table-request.model";
-import { MatDialog } from "@angular/material/dialog";
-import { ENV } from "../../environments/environment";
-import { Observable, firstValueFrom } from "rxjs";
-import { ObjectToHttpParams } from "../../utils/http.utils";
-import { DecksService } from "./decks.service";
+import { Injectable, Logger } from "@nestjs/common";
+import { User } from "@prisma/client";
+import { log } from "console";
+import e from "express";
+import { PrismaService } from "nestjs-prisma";
+import { CreateCodeDto } from "src/dtos/codes/create-code.dto";
+import { CreateMultiCodeDto } from "src/dtos/codes/create-multi-code.dto";
+import { UpdateCodeDto } from "src/dtos/codes/update-code.dto";
+import { FindQueryDto } from "src/dtos/find-query.dto";
+import { generateRandomCode } from "src/utils/code-generation.utils";
+import { Parser } from 'json2csv';
+import { GenerateBadRequestException } from "src/exception/bad-request.exception";
+import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 
-@Injectable({ providedIn: "root" })
+@Injectable()
 export class CodesService {
-    URL = `${ENV.BASE_URL}/codes`;
+    constructor(private prismaService: PrismaService) {}
 
-    constructor(private _httpClient: HttpClient) {}
-
-    read(page: number): Observable<any> {
-        return this._httpClient.get(`${this.URL}`, {
-            params: ObjectToHttpParams({
-                skip: page * 15,
-                limit: 15,
-            }),
+    async create(createDeckDto: CreateCodeDto) {
+        return await this.prismaService.code.create({
+            data: {
+                code: createDeckDto.code ?? generateRandomCode(8),
+                max_uses: createDeckDto.max_uses ?? null,
+                decks: {
+                    createMany: {
+                        data: createDeckDto.decks_ids.map((id) => ({
+                            deck_id: id,
+                        })),
+                    },
+                },
+            },
+            include: {
+                decks: { include: { deck: true } },
+            },
         });
     }
 
-    create(data: any): Observable<any> {
-        return this._httpClient.post(`${this.URL}/`, data);
-    }
-
-    /**
-     * VIP code: ONE code linked to every admin deck that exists right now
-     * (a snapshot, so decks created later are not included) and limited to
-     * `maxUses` students. The limit is sent as `max_uses` and must be enforced
-     * by the backend when a student redeems the code.
-     */
-    async createVip(
-        code: string,
-        maxUses: number,
-    ): Promise<{ code: string; decks: number }> {
-        const decks = await new DecksService(this._httpClient).readAll();
-        const ids = decks.map((d: any) => d.id);
-        if (!ids.length) throw new Error("There are no decks to link.");
-        // The admin always chooses the code (the server needs 6-20 characters).
-        const finalCode = code.trim();
-        if (finalCode.length < 6 || finalCode.length > 20)
-            throw new Error("The code must be 6 to 20 characters.");
-        const created: any = await firstValueFrom(
-            this.create({ code: finalCode, decks_ids: ids, max_uses: maxUses }),
-        );
-        // An old backend silently ignores max_uses and makes a normal single-use code.
-        if (created?.max_uses !== maxUses) {
-            throw new Error(
-                "The server did not save the usage limit (it is running an old backend version). " +
-                    "Deploy the updated backend, then delete this code and create it again.",
-            );
-        }
-        return { code: finalCode, decks: ids.length };
-    }
-
-    private randomCode(len: number): string {
-        const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no look-alike characters
-        const buf = new Uint32Array(len);
-        crypto.getRandomValues(buf);
-        return Array.from(buf, (n) => chars[n % chars.length]).join("");
-    }
-
-    generate(data: any): Observable<any> {
-        return this._httpClient.post(`${this.URL}/create-multi-code`, data);
-    }
-
-   
-    /**
-     * Generates codes and returns ONLY the ones this call created.
-     * Uses the server response when it lists the codes; otherwise it compares
-     * the table before/after (ids newer than anything that existed before).
-     */
-    async generateAndCollect(
-        formData: any,
-    ): Promise<{ code: string; decks: string; created_at: string }[]> {
-        const toRow = (r: any) => ({
-            code: typeof r === "string" ? r : String(r?.code ?? ""),
-            decks: (r?.decks ?? [])
-                .map((d: any) => d?.deck?.title)
-                .filter(Boolean)
-                .join(", "),
-            created_at: String(r?.created_at ?? ""),
-        });
-
-        // snapshot of both ends of the table before generating
-        const edges = async () => {
-            const first: any = await firstValueFrom(this.read(0));
-            const total = Number(first?.count ?? 0);
-            const lastPage = Math.max(0, Math.ceil(total / 15) - 1);
-            const last: any =
-                lastPage > 0 ? await firstValueFrom(this.read(lastPage)) : first;
-            return {
-                total,
-                lastPage,
-                rows: [...(first?.data ?? []), ...(last?.data ?? [])] as any[],
-            };
-        };
-        const before = await edges();
-
-        const resp: any = await firstValueFrom(this.generate(formData));
-        const list = Array.isArray(resp)
-            ? resp
-            : (resp?.codes ?? resp?.data ?? resp?.items ?? null);
-        if (Array.isArray(list) && list.length && list.every((r: any) =>
-            typeof r === "string" || r?.code)) {
-            return list.map(toRow);
-        }
-
-        // fall back: read what is new
-        const want = Number(formData?.count ?? 1);
-        const after = await edges();
-        const pages = new Set<number>([0, after.lastPage]);
-        // include one more page at each end if the batch is bigger than a page
-        for (let i = 1; i * 15 < want + 15; i++) {
-            pages.add(i);
-            pages.add(Math.max(0, after.lastPage - i));
-        }
-        const seen = new Map<any, any>();
-        for (const pg of pages) {
-            const r: any = await firstValueFrom(this.read(pg));
-            for (const row of r?.data ?? []) seen.set(row.id, row);
-        }
-        const beforeIds = new Set(before.rows.map((r) => r.id));
-        const numeric = before.rows.map((r) => Number(r.id)).filter((n) => !isNaN(n));
-        const maxBefore = numeric.length ? Math.max(...numeric) : -Infinity;
-        const fresh = [...seen.values()].filter((r) =>
-            !isNaN(Number(r.id)) && isFinite(maxBefore)
-                ? Number(r.id) > maxBefore
-                : !beforeIds.has(r.id),
-        );
-        return fresh.sort((a, b) => Number(a.id) - Number(b.id)).map(toRow);
-    }
-
-    downloadCsv(): void {
-        this._httpClient.get(`${this.URL}/export-csv`, { responseType: 'blob' }).subscribe({
-          next: (data: Blob) => {
-            const blob = new Blob([data], { type: 'text/csv;charset=utf-8;' });
-            const downloadURL = window.URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = downloadURL;
-            link.download = 'codes.csv';
-            link.click();
-            window.URL.revokeObjectURL(downloadURL);
-          },
-          error: (err) => {
-            console.error('Download failed', err);
+    async createMultiCode(createDeckDto: CreateMultiCodeDto) {
+        const count = createDeckDto.count ?? 1;
+        const length = createDeckDto.length ?? 8;
+      
+        const codeValues: { code: string }[] = [];
+        const deckRelations: { code_id: string; deck_id: number }[] = [];
+      
+        for (const deckId of createDeckDto.decks_ids) {
+          for (let i = 0; i < count; i++) {
+            const code = generateRandomCode(length);
+            codeValues.push({ code });
+            deckRelations.push({code_id: code, deck_id: deckId });
           }
+        }
+      
+        const allCodes = codeValues.map(c => c.code);
+      
+        // 🔍 Step 1: Find existing codes
+        const existingCodes = await this.prismaService.code.findMany({
+          where: { code: { in: allCodes } },
+          select: { code: true },
         });
+
+        new  Logger('adfsd').log(existingCodes);
+        const existingCodeSet = new Set(existingCodes.map(e => e.code));
+      
+        // ✂️ Step 2: Remove existing codes from both arrays
+        const filteredCodeValues = codeValues.filter(c => !existingCodeSet.has(c.code));
+       const filteredDeckRelations = deckRelations.filter(r => !existingCodeSet.has(r.code_id));
+      
+
+        const uniqueFilteredCodeValues = filteredCodeValues.filter(
+            (item, index, self) =>
+              index === self.findIndex((t) => t.code === item.code)
+          );
+
+
+          const uniqueFilteredDeckRelations = filteredDeckRelations.filter(
+            (item, index, self) =>
+              index === self.findIndex((t) => t.code_id === item.code_id)
+          );
+
+        // ⚡ Step 3: Create only new codes
+        await this.prismaService.code.createMany({
+          data: uniqueFilteredCodeValues,
+          
+        });
+      
+        // 📥 Step 4: Fetch inserted codes to get their IDs
+        const createdCodes = await this.prismaService.code.findMany({
+          where: { code: { in: uniqueFilteredCodeValues.map(c => c.code) } },
+        });
+      
+        const codeMap = new Map(createdCodes.map(c => [c.code, c.id]));
+      
+        // 🔗 Step 5: Create deck-code links
+        const deckOnCodeEntries = uniqueFilteredDeckRelations.map(rel => ({
+          deck_id: rel.deck_id,
+          code_id: codeMap.get(rel.code_id)!,
+        }));
+      
+        await this.prismaService.codeDeck.createMany({
+          data: deckOnCodeEntries,
+          skipDuplicates: true,
+        });
+      
+        return createdCodes;
+      }
+      
+
+      async getCodesAsCSV(): Promise<string> {
+        const codes = await this.prismaService.code.findMany({
+          include: {
+            decks: { include: { deck: true } }, // join deck
+          },
+        });
+      
+        const flattened = codes.flatMap(code =>
+          code.decks.map(relation => ({
+            code_id: code.id,
+            code: code.code,
+            deck_name: relation.deck.title,
+          }))
+        );
+      
+        // Add counter column
+        const withCounter = flattened.map((item, index) => ({
+          index: index + 1,
+          ...item,
+        }));
+      
+        const fields = ['index', 'code_id', 'code', 'deck_name'];
+        const parser = new Parser({ fields });
+         return '\uFEFF' + parser.parse(withCounter); // add UTF-8 BOM
       }
 
-    update(id: number, data: any): Observable<any> {
-        return this._httpClient.put(`${this.URL}/${id}`, data);
+    async read(findQueryDto: FindQueryDto) {
+        const codes = await this.prismaService.code.findMany({
+            skip: findQueryDto.skip,
+            take: findQueryDto.limit,
+            where: findQueryDto.filter ?? {},
+            orderBy: findQueryDto.sort ?? { created_at: "desc" },
+            include: { decks: { include: { deck: true } } },
+        });
+
+        const count = await this.prismaService.code.count({
+            where: findQueryDto.filter ?? {},
+        });
+
+        return { count, data: codes };
     }
 
-    delete(id: number): Observable<any> {
-        return this._httpClient.delete(`${this.URL}/${id}`);
+    async readOne(id: number) {
+        const code = await this.prismaService.code.findUnique({
+            where: { id },
+            include: { decks: { include: { deck: true } } },
+        });
+
+        return code;
+    }
+
+    async update(id: number, updateCodeDto: UpdateCodeDto) {
+        const code = await this.prismaService.code.update({
+            where: {
+                id,
+            },
+            data: {
+                code: updateCodeDto.code,
+                ...(updateCodeDto.max_uses != null
+                    ? { max_uses: updateCodeDto.max_uses }
+                    : {}),
+                decks: {
+                    deleteMany: {},
+                    createMany: {
+                        data: updateCodeDto.decks_ids.map((id) => ({
+                            deck_id: id,
+                        })),
+                    },
+                },
+            },
+            include: {
+                decks: { include: { deck: true } },
+            },
+        });
+
+        return code;
+    }
+
+    async delete(id: number) {
+        await this.prismaService.$transaction([
+            this.prismaService.codeDeck.deleteMany({
+                where: {
+                    code_id: id,
+                },
+            }),
+            this.prismaService.code.delete({
+                where: { id },
+            }),
+        ]);
+    }
+
+    async linkDecksByCode(user: User, rawCode: string) {
+        const code = String(rawCode ?? "").trim();
+        const codeEntity = await this.prismaService.code.findUnique({
+            where: { code },
+            include: { decks: true },
+        });
+
+        if (codeEntity == null) {
+            // codes are deleted once used: a record of this user's use means they entered it before
+            const used = await this.prismaService.codeRedemption.findUnique({
+                where: { code_user_id: { code, user_id: user.id } },
+            });
+            if (used) GenerateBadRequestException(["لقد ادخلت الكود بالفعل"]);
+            GenerateBadRequestException(["Code Does Not Exist"]);
+        }
+
+        const userDecks = await this.prismaService.userDeck.findMany({
+            where: {
+                user_id: user.id,
+                deck_id: { in: codeEntity.decks.map((deck) => deck.deck_id) },
+            },
+        });
+        const have = new Set(userDecks.map((ud) => ud.deck_id));
+        const toAdd = codeEntity.decks
+            .filter((cd) => !have.has(cd.deck_id))
+            .map((cd) => cd.deck_id);
+
+        if (codeEntity.max_uses != null) {
+            // VIP code: stays in the database and can be used by `max_uses` different students.
+            const already = await this.prismaService.codeRedemption.findUnique({
+                where: { code_user_id: { code, user_id: user.id } },
+            });
+            if (already) GenerateBadRequestException(["لقد ادخلت الكود بالفعل"]);
+
+            await this.prismaService.$transaction(async (tx) => {
+                // Unique (code, user): a second try by the same student fails here.
+                await tx.codeRedemption.create({
+                    data: { code, user_id: user.id },
+                });
+                // Atomic limit check: only counts up while used_count is still below the limit,
+                // so 1000 students at the same moment can never get a 1001st use.
+                const bumped = await tx.code.updateMany({
+                    where: {
+                        id: codeEntity.id,
+                        used_count: { lt: codeEntity.max_uses! },
+                    },
+                    data: { used_count: { increment: 1 } },
+                });
+                if (bumped.count === 0) {
+                    GenerateBadRequestException([
+                        "تم استخدام هذا الكود الحد الأقصى من المرات",
+                    ]);
+                }
+                await tx.userDeck.createMany({
+                    data: toAdd.map((id) => ({
+                        user_id: user.id,
+                        deck_id: id,
+                        editable: false,
+                        sharable: false,
+                    })),
+                    skipDuplicates: true,
+                });
+            }, { timeout: 20000, maxWait: 20000 });
+
+            invalidateHierarchy(user.id);
+            return;
+        }
+
+        // Normal code: all-or-nothing: the decks, the "used" record and the code's removal go together
+        await this.prismaService.$transaction([
+            this.prismaService.userDeck.createMany({
+                data: toAdd.map((id) => ({
+                    user_id: user.id,
+                    deck_id: id,
+                    editable: false,
+                    sharable: false,
+                })),
+                skipDuplicates: true,
+            }),
+            this.prismaService.codeRedemption.upsert({
+                where: { code_user_id: { code, user_id: user.id } },
+                create: { code, user_id: user.id },
+                update: {},
+            }),
+            this.prismaService.codeDeck.deleteMany({
+                where: { code_id: codeEntity.id },
+            }),
+            this.prismaService.code.deleteMany({ where: { id: codeEntity.id } }),
+        ]);
+
+        // The deck list is cached per user for 60s: without this the new subject
+        // did not show up until the cache expired (users had to leave and re-enter).
+        invalidateHierarchy(user.id);
     }
 }
