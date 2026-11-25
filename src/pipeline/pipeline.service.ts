@@ -6,6 +6,7 @@ import { DecksCardsService } from "src/services/decks-cards.service";
 import { MediaService } from "src/services/media.service";
 import { EmailService } from "src/services/email.service";
 import { McqService } from "src/mcq/mcq.service";
+import { COMBINED, Models3dService } from "src/models3d/models3d.service";
 import { invalidateHierarchy } from "src/utils/hierarchy-cache";
 import { Cfg, Doctor, Engine, IO, Lecture } from "./engine";
 import { EstCfg, EstLecture, Estimate, calibration, estimate as buildEstimate, lectureParts } from "./estimate";
@@ -42,6 +43,7 @@ export class PipelineService implements OnApplicationBootstrap {
         private media: MediaService,
         private email: EmailService,
         private mcq: McqService,
+        private models3d: Models3dService,
     ) {}
 
     // After a restart/redeploy of the free server, unfinished jobs continue by themselves.
@@ -130,7 +132,7 @@ export class PipelineService implements OnApplicationBootstrap {
             polishWithFile: c.polishWithFile !== false, cutout: c.cutout !== false,
             // photos === false -> "3D models only": no web picture search at all, cards only get models from the library
             optImages: (c as any).photos !== false, parallel: Math.max(1, Math.min(3, Math.floor(Number((c as any).parallel)) || 2)),
-            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65,
+            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65, modelBones: c.modelBones !== false,
         } as Cfg;
         const job = await this.prisma.pipelineJob.create({
             data: { title: body.title || `${config.subject}`, user_id: user.id, config: config as any, state: { subjectId: null, doctors, createdAt: Date.now() } as any, log: [] },
@@ -435,8 +437,9 @@ export class PipelineService implements OnApplicationBootstrap {
             },
             updateCard: async (deckId, cid, type, data) => { await this.cards.update(user, deckId, cid, { type, data } as any); },
             deleteCard: async (deckId, cid) => { await this.cards.delete(undefined, deckId, cid); },
-            loadModels: async () => (await this.prisma.model3D.findMany({ orderBy: { name: "asc" } }))
+            loadModels: async () => (await this.prisma.model3D.findMany({ where: { OR: [{ category: null }, { category: { not: COMBINED } }] }, orderBy: { name: "asc" } }))
                 .map((m) => ({ id: m.id, name: m.name, aliases: m.aliases ?? "", category: m.category ?? "", file: m.file_name })),
+            combineModels: async (modelId, boneIds) => (await this.models3d.combine(modelId, boneIds)).file_name,
             attach: async (cid, png) => {
                 const m = await this.media.create({ buffer: png, originalname: `card_${cid}.png`, mimetype: "image/png", size: png.length } as any, MediaType.IMAGE);
                 await this.prisma.card.update({ where: { id: cid }, data: { back_image_name: m.name } });
@@ -461,7 +464,7 @@ export class PipelineService implements OnApplicationBootstrap {
             threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
             polishWithFile: true, cutout: c.cutout !== false,
             optQuality: c.optQuality !== false, optDups: c.optDups !== false, optImages: c.optImages !== false, pictureMode: mode, parallel: Math.max(1, Math.min(3, Math.floor(Number(c.parallel)) || 2)),
-            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65,
+            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65, modelBones: c.modelBones !== false,
         } as Cfg;
         const lectures: Lecture[] = ids.map((id): Lecture => ({
             id: `d${id}`, name: byId.get(id)!.title, fileName: "", size: 0, status: "queued", msg: "", progress: "", stage: "written",
