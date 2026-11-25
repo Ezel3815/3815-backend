@@ -59,6 +59,8 @@ export interface Cfg {
     modelThreshold?: number;
     /** A muscle model is shown together with the bones it attaches to (default on). */
     modelBones?: boolean;
+    /** Only upgrade cards that ALREADY show a muscle model: add the bones it attaches to, keep everything else on the card. */
+    reboneExisting?: boolean;
     /** How many lectures the server works on at the same time (1-3, default 2). */
     parallel?: number;
 }
@@ -75,7 +77,7 @@ export interface IO {
 }
 interface Cand { thumb: string; title: string; src: string; lic: string }
 interface PCard { id: number; deckId: number; deck: string; type: string; data: any; q: string; a: string; side: "front" | "back"; noPic: boolean }
-interface Mdl { c: PCard; modelId: number; name: string; file: string; conf: number; reason: string; bones: number[] }
+interface Mdl { c: PCard; modelId: number; name: string; file: string; conf: number; reason: string; bones: number[]; keepSide?: string }
 type St = "idle" | "working" | "done" | "error";
 interface Fix { c: PCard; newQ: string; newA: string; reason: string; conf: number; apply: boolean; st: St; msg: string }
 interface Dup { c: PCard; keeper: PCard; reason: string; conf: number; apply: boolean; st: St; msg: string }
@@ -300,7 +302,7 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q).slice(0, 140), a: pl
         if (!this.optImages) this.say(`${d.title}: photos are off, only 3D models from the library are assigned`);
         // 2a) 3D models from the library: a matching model is used INSTEAD of searching for a picture
         const modelled = new Set<number>();
-        if (this.cfg.use3d !== false && this.cfg.models3dMode !== "off" && await this.wants3d(d.title, cards)) {
+        if (this.cfg.use3d !== false && this.cfg.models3dMode !== "off" && (this.cfg.reboneExisting || await this.wants3d(d.title, cards))) {
             try {
                 for (const m of await this.pickModels(d.title, cards, gone)) {
                     this.models.push(m);
@@ -381,6 +383,7 @@ Return ONLY JSON: {"anatomy": true, "confidence": 90}`,
         const withBones = this.cfg.modelBones !== false && !!this.io.combineModels;
         const isBone = (m: { category: string }) => /bone|skelet|osteo/i.test(m.category);
         const hasBoneCat = lib.some(isBone); // when the library marks its bones, only those can be added
+        if (this.cfg.reboneExisting) return this.pickBonesForExisting(title, cards, gone, lib, isBone, hasBoneCat);
         const todo = cards.filter((c) => !gone.has(c.id) && !c.data?.model?.url && (c.noPic || this.cfg.replacePhotos !== false));
         const out: Mdl[] = [];
         const starts: number[] = []; for (let s = 0; s < todo.length; s += 30) starts.push(s);
@@ -407,6 +410,41 @@ ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q), a: plain(c.a) })))}
                 const bones = withBones && !isBone(m) ? [...new Set<number>((Array.isArray(o?.bone_ids) ? o.bone_ids : []).map(Number))]
                     .filter((id) => id !== m.id && byId.has(id) && (!hasBoneCat || isBone(byId.get(id)!))).slice(0, 4) : [];
                 out.push({ c, modelId: m.id, name: m.name, file: m.file, conf: clamp(o?.confidence), reason: String(o?.reason ?? ""), bones });
+            }
+        });
+        return out;
+    }
+
+    /** Cards that already show a library MUSCLE (no bones yet): the AI only chooses the bones. The muscle, the side and the rest of the card are kept. */
+    private async pickBonesForExisting(title: string, cards: PCard[], gone: Set<number>, lib: { id: number; name: string; aliases: string; category: string; file: string }[], isBone: (m: { category: string }) => boolean, hasBoneCat: boolean): Promise<Mdl[]> {
+        const byFile = new Map(lib.map((m) => [m.file, m]));
+        const todo = cards.filter((c) => !gone.has(c.id)).map((c) => ({ c, m: byFile.get(String(c.data?.model?.url ?? "")) })).filter((x): x is { c: PCard; m: (typeof lib)[number] } => !!x.m && !isBone(x.m));
+        const cands = lib.filter((m) => !hasBoneCat || isBone(m));
+        const byId = new Map(cands.map((m) => [m.id, m]));
+        const catalog = cands.map((m) => `${m.id}: ${m.name}${m.aliases ? " | " + m.aliases : ""}`).join("\n");
+        const out: Mdl[] = [];
+        const starts: number[] = []; for (let s = 0; s < todo.length; s += 30) starts.push(s);
+        await this.pmap(starts, this.conc(), async (s) => {
+            const part = todo.slice(s, s + 30);
+            this.progress = `${title}: bones for existing models ${s + 1}-${Math.min(s + 30, todo.length)} of ${todo.length}`;
+            const { data } = await this.ai(`Each flashcard of the lecture "${title}" already shows a 3D MUSCLE (or soft structure) model. Choose the library BONES it attaches to or lies on (its origin and insertion), so it is not shown floating alone.
+BONE LIBRARY (id: name | other names):
+${catalog}
+
+Use ONLY ids from this library, at most 4 per card, only bones the card's text is about or that carry the structure's origin and insertion. If no fitting bone exists, return [].
+"confidence" 0-100: how sure you are of the chosen bones. "reason": one short sentence in the card's language.
+Return ONLY a JSON array, one entry per card: [{"id":1,"confidence":90,"reason":"...","bone_ids":[3,8]}]
+
+CARDS (model = the muscle already on the card):
+${JSON.stringify(part.map((x) => ({ id: x.c.id, model: x.m.name, q: plain(x.c.q), a: plain(x.c.a) })))}`,
+                { type: "ARRAY", items: { type: "OBJECT", properties: { id: { type: "INTEGER" }, confidence: { type: "NUMBER" }, reason: { type: "STRING" }, bone_ids: { type: "ARRAY", items: { type: "INTEGER" } } }, required: ["id", "confidence", "reason", "bone_ids"] } },
+                { maxTokens: 4000 });
+            const byCard = new Map(part.map((x) => [x.c.id, x]));
+            for (const o of Array.isArray(data) ? data : []) {
+                const x = byCard.get(Number(o?.id)); if (!x) continue;
+                const bones = [...new Set<number>((Array.isArray(o?.bone_ids) ? o.bone_ids : []).map(Number))].filter((id) => id !== x.m.id && byId.has(id)).slice(0, 4);
+                if (!bones.length) continue;
+                out.push({ c: x.c, modelId: x.m.id, name: x.m.name, file: x.m.file, conf: clamp(o?.confidence), reason: String(o?.reason ?? ""), bones, keepSide: x.c.data?.model?.side });
             }
         });
         return out;
@@ -699,7 +737,7 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
                     try { file = await this.io.combineModels(m.modelId, m.bones); label = `${m.name} + ${m.bones.length} bone${m.bones.length === 1 ? "" : "s"}`; }
                     catch (e: any) { this.say(`${l.name}: could not add the bones to "${m.name}" (${String(e?.message || e)}); using the model alone`); }
                 }
-                data.model = { side: this.cfg.modelSide === "front" ? "front" : "back", url: file };
+                data.model = { ...(data.model ?? {}), side: m.keepSide ?? (this.cfg.modelSide === "front" ? "front" : "back"), url: file };
                 await this.io.updateCard(m.c.deckId, m.c.id, m.c.type, data);
                 rep.models.push({ ...brief(m.c), model: label, conf: m.conf, reason: m.reason });
             } catch (e: any) { rep.lowConf.push({ kind: "3D model failed", ...brief(m.c), reason: String(e?.message || e), conf: m.conf }); }
