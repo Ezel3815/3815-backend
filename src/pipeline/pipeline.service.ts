@@ -132,7 +132,7 @@ export class PipelineService implements OnApplicationBootstrap {
             polishWithFile: c.polishWithFile !== false, cutout: c.cutout !== false,
             // photos === false -> "3D models only": no web picture search at all, cards only get models from the library
             optImages: (c as any).photos !== false, parallel: Math.max(1, Math.min(3, Math.floor(Number((c as any).parallel)) || 2)),
-            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65, modelBones: c.modelBones !== false,
+            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65, modelBones: c.modelBones !== false, reboneExisting: c.reboneExisting === true,
         } as Cfg;
         const job = await this.prisma.pipelineJob.create({
             data: { title: body.title || `${config.subject}`, user_id: user.id, config: config as any, state: { subjectId: null, doctors, createdAt: Date.now() } as any, log: [] },
@@ -464,7 +464,7 @@ export class PipelineService implements OnApplicationBootstrap {
             threshold: Number(c.threshold) || 85, deleteThreshold: Number(c.deleteThreshold) || 92, pictureThreshold: Number(c.pictureThreshold) || 70,
             polishWithFile: true, cutout: c.cutout !== false,
             optQuality: c.optQuality !== false, optDups: c.optDups !== false, optImages: c.optImages !== false, pictureMode: mode, parallel: Math.max(1, Math.min(3, Math.floor(Number(c.parallel)) || 2)),
-            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65, modelBones: c.modelBones !== false,
+            use3d: this.mode3d(c) !== "off", models3dMode: this.mode3d(c), replacePhotos: c.replacePhotos !== false, modelSide: c.modelSide === "front" ? "front" : "back", modelThreshold: Number(c.modelThreshold) || 65, modelBones: c.modelBones !== false, reboneExisting: c.reboneExisting === true,
         } as Cfg;
         const lectures: Lecture[] = ids.map((id): Lecture => ({
             id: `d${id}`, name: byId.get(id)!.title, fileName: "", size: 0, status: "queued", msg: "", progress: "", stage: "written",
