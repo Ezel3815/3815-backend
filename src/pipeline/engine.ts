@@ -57,6 +57,8 @@ export interface Cfg {
     modelSide?: "front" | "back";
     /** Confidence needed to assign a 3D model (default: lower than for pictures, so more cards get models). */
     modelThreshold?: number;
+    /** A muscle model is shown together with the bones it attaches to (default on). */
+    modelBones?: boolean;
     /** How many lectures the server works on at the same time (1-3, default 2). */
     parallel?: number;
 }
@@ -68,10 +70,12 @@ export interface IO {
     deleteCard(deckId: number, id: number): Promise<void>;
     attach(cardId: number, png: Buffer): Promise<void>;
     loadModels(): Promise<{ id: number; name: string; aliases: string; category: string; file: string }[]>;
+    /** One model file made of a library model plus the bones around it (returns the stored file name). */
+    combineModels?(modelId: number, boneIds: number[]): Promise<string>;
 }
 interface Cand { thumb: string; title: string; src: string; lic: string }
 interface PCard { id: number; deckId: number; deck: string; type: string; data: any; q: string; a: string; side: "front" | "back"; noPic: boolean }
-interface Mdl { c: PCard; modelId: number; name: string; file: string; conf: number; reason: string }
+interface Mdl { c: PCard; modelId: number; name: string; file: string; conf: number; reason: string; bones: number[] }
 type St = "idle" | "working" | "done" | "error";
 interface Fix { c: PCard; newQ: string; newA: string; reason: string; conf: number; apply: boolean; st: St; msg: string }
 interface Dup { c: PCard; keeper: PCard; reason: string; conf: number; apply: boolean; st: St; msg: string }
@@ -374,6 +378,9 @@ Return ONLY JSON: {"anatomy": true, "confidence": 90}`,
         if (!lib.length) return [];
         const byId = new Map(lib.map((m) => [m.id, m]));
         const catalog = lib.map((m) => `${m.id}: ${m.name}${m.aliases ? " | " + m.aliases : ""}${m.category ? " [" + m.category + "]" : ""}`).join("\n");
+        const withBones = this.cfg.modelBones !== false && !!this.io.combineModels;
+        const isBone = (m: { category: string }) => /bone|skelet|osteo/i.test(m.category);
+        const hasBoneCat = lib.some(isBone); // when the library marks its bones, only those can be added
         const todo = cards.filter((c) => !gone.has(c.id) && !c.data?.model?.url && (c.noPic || this.cfg.replacePhotos !== false));
         const out: Mdl[] = [];
         const starts: number[] = []; for (let s = 0; s < todo.length; s += 30) starts.push(s);
@@ -385,18 +392,21 @@ LIBRARY (id: name | other names or languages [category]):
 ${catalog}
 
 For EACH card decide whether ONE library model shows exactly the structure the card is about (for example a card about the origin or action of the biceps brachii -> the "Biceps brachii" model). This is only for the ANATOMY of a structure (what it is, where it is, its parts, attachments, relations). A card about the physiology, pathology, drugs, tests or treatment of an organ is NOT a match. Pick a model only when the card's main subject IS that structure. NEVER pick a model that only belongs to the same region, organ system or a neighbouring structure. If no model fits exactly, model_id = 0.
-"confidence" 0-100: how sure you are that this model is the right one for this card. "reason": one short sentence in the card's language.
-Return ONLY a JSON array with one entry per card: [{"id":1,"model_id":12,"confidence":90,"reason":"..."}]
+"confidence" 0-100: how sure you are that this model is the right one for this card. "reason": one short sentence in the card's language.${withBones ? `
+"bone_ids": when the chosen model is a MUSCLE (or another soft structure), the library BONES it attaches to or lies on, so it is not shown floating alone (for example the biceps brachii -> the scapula and the radius). Use ONLY ids of bones that exist in the library, at most 4, and only the bones the card's text is about or that carry the structure's origin and insertion. When the chosen model is itself a bone, or no fitting bone is in the library, return [].` : ""}
+Return ONLY a JSON array with one entry per card: [{"id":1,"model_id":12,"confidence":90,"reason":"..."${withBones ? ',"bone_ids":[3,8]' : ""}}]
 
 CARDS:
 ${JSON.stringify(part.map((c) => ({ id: c.id, q: plain(c.q), a: plain(c.a) })))}`,
-                { type: "ARRAY", items: { type: "OBJECT", properties: { id: { type: "INTEGER" }, model_id: { type: "INTEGER" }, confidence: { type: "NUMBER" }, reason: { type: "STRING" } }, required: ["id", "model_id", "confidence", "reason"] } },
+                { type: "ARRAY", items: { type: "OBJECT", properties: { id: { type: "INTEGER" }, model_id: { type: "INTEGER" }, confidence: { type: "NUMBER" }, reason: { type: "STRING" }, ...(withBones ? { bone_ids: { type: "ARRAY", items: { type: "INTEGER" } } } : {}) }, required: ["id", "model_id", "confidence", "reason"] } },
                 { maxTokens: 4000 });
             const byCard = new Map(part.map((c) => [c.id, c]));
             for (const o of Array.isArray(data) ? data : []) {
                 const c = byCard.get(Number(o?.id)); const m = byId.get(Number(o?.model_id));
                 if (!c || !m) continue;
-                out.push({ c, modelId: m.id, name: m.name, file: m.file, conf: clamp(o?.confidence), reason: String(o?.reason ?? "") });
+                const bones = withBones && !isBone(m) ? [...new Set<number>((Array.isArray(o?.bone_ids) ? o.bone_ids : []).map(Number))]
+                    .filter((id) => id !== m.id && byId.has(id) && (!hasBoneCat || isBone(byId.get(id)!))).slice(0, 4) : [];
+                out.push({ c, modelId: m.id, name: m.name, file: m.file, conf: clamp(o?.confidence), reason: String(o?.reason ?? ""), bones });
             }
         });
         return out;
@@ -684,9 +694,14 @@ Return JSON {"guide": "..."}.${text.trim() ? `\n\nPASTED QUESTIONS:\n${text.slic
             if (m.conf < (this.cfg.modelThreshold ?? pth)) { rep.lowConf.push({ kind: "3D model", ...brief(m.c), reason: `${m.name}: ${m.reason}`, conf: m.conf }); continue; }
             try {
                 const data = JSON.parse(JSON.stringify(m.c.data));
-                data.model = { side: this.cfg.modelSide === "front" ? "front" : "back", url: m.file };
+                let file = m.file, label = m.name;
+                if (m.bones.length && this.io.combineModels) { // muscle + its bones in one file; on any problem the muscle alone is used
+                    try { file = await this.io.combineModels(m.modelId, m.bones); label = `${m.name} + ${m.bones.length} bone${m.bones.length === 1 ? "" : "s"}`; }
+                    catch (e: any) { this.say(`${l.name}: could not add the bones to "${m.name}" (${String(e?.message || e)}); using the model alone`); }
+                }
+                data.model = { side: this.cfg.modelSide === "front" ? "front" : "back", url: file };
                 await this.io.updateCard(m.c.deckId, m.c.id, m.c.type, data);
-                rep.models.push({ ...brief(m.c), model: m.name, conf: m.conf, reason: m.reason });
+                rep.models.push({ ...brief(m.c), model: label, conf: m.conf, reason: m.reason });
             } catch (e: any) { rep.lowConf.push({ kind: "3D model failed", ...brief(m.c), reason: String(e?.message || e), conf: m.conf }); }
         }
         for (const m of this.imgs) {
